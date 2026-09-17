@@ -147,7 +147,7 @@ public class QdrantVectorStore : IVectorStore
         // Give neighbors a slightly discounted score so primary vector matches take precedence
         return neighborResults.Select(n => {
             var res = MapToResult(n);
-            res.Score = baseScore * 0.95f; // Slight penalty for neighbors
+            res.Score = baseScore * 0.95f;
             return res;
         }).ToList();
     }
