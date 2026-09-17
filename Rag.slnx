@@ -1,0 +1,8 @@
+<Solution>
+  <Project Path="Rag.DocumentProcessing.Console/Rag.DocumentProcessing.Console.csproj" Id="d83572c4-c90b-42ed-b453-cef05b96babc" />
+  <Project Path="Rag.DocumentProcessing/Rag.DocumentProcessing.csproj" Id="7bc96c69-cd21-4b4f-9556-b7e6cd5ebb0d" />
+  <Project Path="Rag.EmbeddingGenerator.Console/Rag.EmbeddingGenerator.Console.csproj" Id="7131ba3e-0b28-4014-aed5-db7ec14d372f" />
+  <Project Path="Rag.EmbeddingGenerator/Rag.EmbeddingGenerator.csproj" Id="7537bbff-b9b2-4bac-9e8a-d5158f8667e6" />
+  <Project Path="RAG.Testing.Console/RAG.Testing.Console.csproj" Id="92eb391c-5747-427e-bad6-eb4ea964e5a4" />
+  <Project Path="Rag.VectorStore/Rag.VectorStore.csproj" Id="a19621ea-f6fe-4dda-beec-81784f6ee3cd" />
+</Solution>
