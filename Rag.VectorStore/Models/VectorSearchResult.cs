@@ -14,5 +14,12 @@ public class VectorSearchResult
 
     public string Text { get; set; } = string.Empty;
     public string ParentText { get; set; } = string.Empty;
-    
+
+    public string DocumentType { get; set; } = string.Empty;
+    public string FileType { get; set; } = string.Empty;
+    public string RelativePath { get; set; } = string.Empty;
+    public int? PageNumber { get; set; }
+    public string? SheetName { get; set; }
+    public string? SqlObjectType { get; set; }
+
 }

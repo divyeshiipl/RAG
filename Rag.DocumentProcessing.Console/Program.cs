@@ -1,4 +1,7 @@
 ﻿using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Options;
+using Rag.DocumentProcessing.Configuration;
 using Rag.DocumentProcessing.Constants;
 using Rag.DocumentProcessing.Data;
 using Rag.DocumentProcessing.Interfaces;
@@ -6,6 +9,14 @@ using Rag.DocumentProcessing.Parsers;
 using Rag.DocumentProcessing.Services;
 
 var services = new ServiceCollection();
+var configuration = new ConfigurationBuilder()
+    .SetBasePath(AppContext.BaseDirectory)
+    .AddJsonFile("appsettings.json", optional: false, reloadOnChange: false)
+    .Build();
+
+services.AddSingleton<IConfiguration>(configuration);
+services.AddOptions<DocumentProcessingOptions>()
+    .Bind(configuration.GetSection("RagPaths"));
 
 services.AddSingleton<IDocumentParser, UniversalDocumentParser>();
 services.AddSingleton<IChunkingService, ChunkingService>();
@@ -25,7 +36,9 @@ foreach (var document in DocumentRepository.Documents)
         $"Checking Document: {document.DocumentName}");
 
     var filePath = Path.Combine(
-        DocumentConstants.DocumentsRootPath,
+        serviceProvider
+            .GetRequiredService<IOptions<DocumentProcessingOptions>>()
+            .Value.DocumentsRootPath,
         document.RelativePath.Replace(
             '/',
             Path.DirectorySeparatorChar));

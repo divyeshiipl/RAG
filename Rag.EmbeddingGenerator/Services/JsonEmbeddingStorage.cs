@@ -1,5 +1,6 @@
 ﻿using System.Text.Json;
-using Rag.EmbeddingGenerator.Constants;
+using Microsoft.Extensions.Options;
+using Rag.DocumentProcessing.Configuration;
 using Rag.EmbeddingGenerator.Interfaces;
 using Rag.EmbeddingGenerator.Models;
 
@@ -7,6 +8,19 @@ namespace Rag.EmbeddingGenerator.Services;
 
 public class JsonEmbeddingStorage : IEmbeddingStorage
 {
+    private readonly string _embeddingsRootPath;
+
+    public JsonEmbeddingStorage(IOptions<DocumentProcessingOptions> options)
+    {
+        _embeddingsRootPath = options.Value.EmbeddingsRootPath;
+
+        if (string.IsNullOrWhiteSpace(_embeddingsRootPath))
+        {
+            throw new InvalidOperationException(
+                $"Configuration setting '{nameof(DocumentProcessingOptions.EmbeddingsRootPath)}' must be provided.");
+        }
+    }
+
     public async Task SaveAsync(
         IEnumerable<EmbeddingRecord> embeddings,
         CancellationToken cancellationToken = default)
@@ -14,7 +28,7 @@ public class JsonEmbeddingStorage : IEmbeddingStorage
         foreach (var embedding in embeddings)
         {
             var directory = Path.Combine(
-                EmbeddingConstants.EmbeddingsRootPath,
+                _embeddingsRootPath,
                 embedding.DocumentId);
 
             Directory.CreateDirectory(directory);

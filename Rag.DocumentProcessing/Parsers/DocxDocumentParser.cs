@@ -14,16 +14,11 @@ public class DocxDocumentParser : IDocumentParser
         string filePath,
         CancellationToken cancellationToken = default)
     {
-        using var document =
-            WordprocessingDocument.Open(filePath, false);
-
-        var body =
-            document.MainDocumentPart?.Document.Body;
+        using var document = WordprocessingDocument.Open(filePath, false);
+        var body = document.MainDocumentPart?.Document.Body;
 
         if (body is null)
-        {
             return Task.FromResult(string.Empty);
-        }
 
         var builder = new StringBuilder();
 
@@ -35,37 +30,27 @@ public class DocxDocumentParser : IDocumentParser
             {
                 case Paragraph paragraph:
                     {
-                        var text =
-                            GetParagraphText(paragraph);
-
+                        var text = GetParagraphText(paragraph);
                         if (!string.IsNullOrWhiteSpace(text))
-                        {
                             builder.AppendLine(text);
-                        }
-
                         break;
                     }
 
                 case Table table:
                     {
-                        var tableText =
-                            GetTableText(table);
-
+                        var tableText = GetTableAsMarkdown(table);
                         if (!string.IsNullOrWhiteSpace(tableText))
                         {
                             builder.AppendLine();
                             builder.AppendLine(tableText);
                             builder.AppendLine();
                         }
-
                         break;
                     }
             }
         }
 
-        return Task.FromResult(
-            NormalizeDocumentText(
-                builder.ToString()));
+        return Task.FromResult(NormalizeDocumentText(builder.ToString()));
     }
 
     public Task<List<string>> ParseAndChunkAsync(
@@ -75,18 +60,13 @@ public class DocxDocumentParser : IDocumentParser
         int overlap = DocumentConstants.Overlap,
         CancellationToken cancellationToken = default)
     {
-        using var document =
-            WordprocessingDocument.Open(filePath, false);
-
-        var body =
-            document.MainDocumentPart?.Document.Body;
+        using var document = WordprocessingDocument.Open(filePath, false);
+        var body = document.MainDocumentPart?.Document.Body;
 
         if (body is null)
-        {
-            return Task.FromResult(
-                new List<string>());
-        }
+            return Task.FromResult(new List<string>());
 
+        // Step 1: Collect blocks
         var blocks = new List<string>();
 
         foreach (var element in body.Elements())
@@ -97,89 +77,55 @@ public class DocxDocumentParser : IDocumentParser
             {
                 case Paragraph paragraph:
                     {
-                        var text =
-                            GetParagraphText(paragraph);
-
+                        var text = GetParagraphText(paragraph);
                         if (!string.IsNullOrWhiteSpace(text))
-                        {
                             blocks.Add(text);
-                        }
-
                         break;
                     }
 
                 case Table table:
                     {
-                        var tableText =
-                            GetTableText(table);
-
+                        var tableText = GetTableAsMarkdown(table);
                         if (!string.IsNullOrWhiteSpace(tableText))
-                        {
                             blocks.Add(tableText);
-                        }
-
                         break;
                     }
             }
         }
 
-        var parentChunks =
-            BuildParentChunks(
-                blocks,
-                chunkSize);
+        // Step 2: Word-based chunking with 20% overlap
+        var chunks = BuildWordBasedChunks(blocks, chunkSize, overlapPercent: 0.20);
 
-        return Task.FromResult(parentChunks);
+        return Task.FromResult(chunks);
     }
 
-    private static string GetParagraphText(
-        Paragraph paragraph)
+    // Paragraph text — no space on Break, but line joins
+    private static string GetParagraphText(Paragraph paragraph)
     {
-        var builder =
-            new StringBuilder();
+        var builder = new StringBuilder();
 
-        var numberingProperties =
-            paragraph
-                .ParagraphProperties?
-                .NumberingProperties;
-
-        var numberingId =
-            numberingProperties?
-                .NumberingId?
-                .Val?
-                .Value;
-
-        var level =
-            numberingProperties?
-                .NumberingLevelReference?
-                .Val?
-                .Value ?? 0;
+        var numberingProperties = paragraph.ParagraphProperties?.NumberingProperties;
+        var numberingId = numberingProperties?.NumberingId?.Val?.Value;
+        var level = numberingProperties?.NumberingLevelReference?.Val?.Value ?? 0;
 
         foreach (var child in paragraph.ChildElements)
         {
             switch (child)
             {
                 case Run run:
-                    AppendRunText(
-                        builder,
-                        run);
+                    AppendRunText(builder, run);
                     break;
 
                 case Hyperlink hyperlink:
-                    AppendElementText(
-                        builder,
-                        hyperlink);
+                    AppendElementText(builder, hyperlink);
                     break;
 
                 case SimpleField field:
-                    AppendElementText(
-                        builder,
-                        field);
+                    AppendElementText(builder, field);
                     break;
 
                 case SdtRun sdtRun:
-                    AppendElementText(
-                        builder,
-                        sdtRun);
+                    AppendElementText(builder, sdtRun);
                     break;
 
                 case BookmarkStart:
@@ -187,43 +133,28 @@ public class DocxDocumentParser : IDocumentParser
                     break;
 
                 default:
-
-                    if (!string.IsNullOrWhiteSpace(
-                        child.InnerText))
-                    {
-                        builder.Append(
-                            child.InnerText);
-                    }
-
+                    if (!string.IsNullOrWhiteSpace(child.InnerText))
+                        builder.Append(child.InnerText);
                     break;
             }
         }
 
-        var text =
-            NormalizeInlineText(
-                builder.ToString());
+        var text = NormalizeInlineText(builder.ToString());
 
         if (string.IsNullOrWhiteSpace(text))
-        {
             return string.Empty;
-        }
 
         if (numberingId.HasValue)
         {
-            var indentation =
-                new string(
-                    ' ',
-                    level * 2);
-
+            var indentation = new string(' ', level * 2);
             return $"{indentation}- {text}";
         }
 
         return text;
     }
 
-    private static void AppendRunText(
-        StringBuilder builder,
-        Run run)
+    //Run text — Break/Tab/CarriageReturn → SPACE
+    private static void AppendRunText(StringBuilder builder, Run run)
     {
         foreach (var child in run.ChildElements)
         {
@@ -234,15 +165,15 @@ public class DocxDocumentParser : IDocumentParser
                     break;
 
                 case TabChar:
-                    builder.Append('\t');
+                    builder.Append(' ');
                     break;
 
                 case Break:
-                    builder.Append('\n');
+                    builder.Append(' ');
                     break;
 
                 case CarriageReturn:
-                    builder.Append('\n');
+                    builder.Append(' ');
                     break;
 
                 case NoBreakHyphen:
@@ -255,19 +186,13 @@ public class DocxDocumentParser : IDocumentParser
 
                 case SymbolChar symbol:
                     if (symbol.Char is not null)
-                    {
-                        builder.Append(
-                            symbol.Char.Value);
-                    }
-
+                        builder.Append(symbol.Char.Value);
                     break;
             }
         }
     }
 
-    private static void AppendElementText(
-        StringBuilder builder,
-        OpenXmlElement element)
+    private static void AppendElementText(StringBuilder builder, OpenXmlElement element)
     {
         foreach (var child in element.Descendants())
         {
@@ -278,204 +203,79 @@ public class DocxDocumentParser : IDocumentParser
                     break;
 
                 case TabChar:
-                    builder.Append('\t');
+                    builder.Append(' ');
                     break;
 
                 case Break:
                 case CarriageReturn:
-                    builder.Append('\n');
+                    builder.Append(' ');
                     break;
             }
         }
     }
 
-    private static string GetTableText(
-        Table table)
+    // TABLE → Markdown
+    private static string GetTableAsMarkdown(Table table)
     {
         var rows = table
             .Elements<TableRow>()
             .Select(row =>
                 row.Elements<TableCell>()
                     .Select(GetCellText)
-                    .Where(text =>
-                        !string.IsNullOrWhiteSpace(text))
                     .ToList())
-            .Where(row => row.Count > 0)
+            .Where(row => row.Count > 0 && row.Any(c => !string.IsNullOrWhiteSpace(c)))
             .ToList();
 
         if (rows.Count == 0)
-        {
             return string.Empty;
-        }
 
-        if (rows.Count == 1)
+        var columnCount = rows.Max(r => r.Count);
+        var builder = new StringBuilder();
+
+        var header = rows[0];
+        builder.Append("| ");
+        for (int i = 0; i < columnCount; i++)
         {
-            return string.Join(
-                " | ",
-                rows[0]);
+            var cell = i < header.Count ? header[i] : string.Empty;
+            builder.Append(EscapeMarkdownCell(cell));
+            builder.Append(" | ");
         }
+        builder.AppendLine();
 
-        var columnCount =
-            rows.Max(row => row.Count);
-
-        if (columnCount == 2)
+        builder.Append("| ");
+        for (int i = 0; i < columnCount; i++)
         {
-            return ConvertKeyValueTable(
-                rows);
+            builder.Append("---");
+            builder.Append(" | ");
         }
+        builder.AppendLine();
 
-        return ConvertStructuredTable(
-            rows);
-    }
-
-    private static string ConvertKeyValueTable(
-        List<List<string>> rows)
-    {
-        var builder =
-            new StringBuilder();
-
-        var firstRow = rows[0];
-
-        var firstCell =
-            firstRow.Count > 0
-                ? firstRow[0]
-                : string.Empty;
-
-        var secondCell =
-            firstRow.Count > 1
-                ? firstRow[1]
-                : string.Empty;
-
-        var hasHeader =
-            IsKeyColumn(firstCell) &&
-            IsValueColumn(secondCell);
-
-        var startIndex =
-            hasHeader ? 1 : 0;
-
-        for (var i = startIndex;
-             i < rows.Count;
-             i++)
+        for (int r = 1; r < rows.Count; r++)
         {
-            var row = rows[i];
-
-            if (row.Count < 2)
+            var row = rows[r];
+            builder.Append("| ");
+            for (int i = 0; i < columnCount; i++)
             {
-                if (row.Count == 1 &&
-                    !string.IsNullOrWhiteSpace(
-                        row[0]))
-                {
-                    builder.AppendLine(
-                        row[0]);
-                }
-
-                continue;
+                var cell = i < row.Count ? row[i] : string.Empty;
+                builder.Append(EscapeMarkdownCell(cell));
+                builder.Append(" | ");
             }
-
-            var key =
-                row[0].Trim();
-
-            var value =
-                row[1].Trim();
-
-            if (string.IsNullOrWhiteSpace(key) &&
-                string.IsNullOrWhiteSpace(value))
-            {
-                continue;
-            }
-
-            if (string.IsNullOrWhiteSpace(key))
-            {
-                builder.AppendLine(value);
-                continue;
-            }
-
-            if (string.IsNullOrWhiteSpace(value))
-            {
-                builder.AppendLine(key);
-                continue;
-            }
-
-            builder.AppendLine(
-                $"{key}: {value}");
+            builder.AppendLine();
         }
 
         return builder.ToString().Trim();
     }
 
-    private static string ConvertStructuredTable(
-        List<List<string>> rows)
+    private static string EscapeMarkdownCell(string value)
     {
-        var builder =
-            new StringBuilder();
-
-        var headers =
-            rows[0];
-
-        for (var rowIndex = 1;
-             rowIndex < rows.Count;
-             rowIndex++)
-        {
-            var row =
-                rows[rowIndex];
-
-            var values =
-                new List<string>();
-
-            for (var columnIndex = 0;
-                 columnIndex < row.Count;
-                 columnIndex++)
-            {
-                var value =
-                    row[columnIndex].Trim();
-
-                if (string.IsNullOrWhiteSpace(value))
-                {
-                    continue;
-                }
-
-                if (columnIndex < headers.Count)
-                {
-                    var header =
-                        headers[columnIndex].Trim();
-
-                    if (!string.IsNullOrWhiteSpace(
-                        header))
-                    {
-                        values.Add(
-                            $"{header}: {value}");
-
-                        continue;
-                    }
-                }
-
-                values.Add(value);
-            }
-
-            if (values.Count == 0)
-            {
-                continue;
-            }
-
-            builder.AppendLine(
-                string.Join(
-                    ", ",
-                    values));
-
-            if (rowIndex < rows.Count - 1)
-            {
-                builder.AppendLine();
-            }
-        }
-
-        return builder.ToString().Trim();
+        if (string.IsNullOrWhiteSpace(value))
+            return string.Empty;
+        return value.Replace("|", "\\|").Trim();
     }
 
-    private static string GetCellText(
-        TableCell cell)
+    private static string GetCellText(TableCell cell)
     {
-        var builder =
-            new StringBuilder();
+        var builder = new StringBuilder();
 
         foreach (var element in cell.Elements())
         {
@@ -483,359 +283,224 @@ public class DocxDocumentParser : IDocumentParser
             {
                 case Paragraph paragraph:
                     {
-                        var text =
-                            GetParagraphText(
-                                paragraph);
-
-                        if (!string.IsNullOrWhiteSpace(
-                            text))
+                        var text = GetParagraphText(paragraph);
+                        if (!string.IsNullOrWhiteSpace(text))
                         {
                             if (builder.Length > 0)
-                            {
                                 builder.Append(' ');
-                            }
-
                             builder.Append(text);
                         }
-
                         break;
                     }
 
                 case Table nestedTable:
                     {
-                        var nestedText =
-                            GetTableText(
-                                nestedTable);
-
-                        if (!string.IsNullOrWhiteSpace(
-                            nestedText))
+                        var nestedText = GetTableAsMarkdown(nestedTable);
+                        if (!string.IsNullOrWhiteSpace(nestedText))
                         {
                             if (builder.Length > 0)
-                            {
                                 builder.Append(' ');
-                            }
-
-                            builder.Append(
-                                nestedText);
+                            builder.Append(nestedText);
                         }
-
                         break;
                     }
             }
         }
 
-        return NormalizeInlineText(
-            builder.ToString());
+        return NormalizeInlineText(builder.ToString());
     }
 
-    private static bool IsKeyColumn(
-        string text)
-    {
-        var value =
-            text.Trim()
-                .ToLowerInvariant();
-
-        return value is
-            "field" or
-            "name" or
-            "property" or
-            "attribute" or
-            "key" or
-            "parameter" or
-            "item";
-    }
-
-    private static bool IsValueColumn(
-        string text)
-    {
-        var value =
-            text.Trim()
-                .ToLowerInvariant();
-
-        return value is
-            "value" or
-            "description" or
-            "details" or
-            "value/details" or
-            "information" or
-            "result";
-    }
-
-    private static List<string> BuildParentChunks(
+    // WORD-BASED CHUNKING (words NEVER break)
+    private static List<string> BuildWordBasedChunks(
         List<string> blocks,
-        int chunkSize)
+        int chunkSize,
+        double overlapPercent = 0.20)
     {
-        var parentChunks =
-            new List<string>();
+        var chunks = new List<string>();
+        if (blocks.Count == 0) return chunks;
 
-        if (blocks.Count == 0)
-        {
-            return parentChunks;
-        }
+        var overlapSize = (int)(chunkSize * overlapPercent);
+        if (overlapSize < 1) overlapSize = 1;
 
-        var currentParent =
-            new StringBuilder();
+        var currentWords = new List<string>();
+        var currentLength = 0;
 
         foreach (var rawBlock in blocks)
         {
-            if (string.IsNullOrWhiteSpace(
-                rawBlock))
+            if (string.IsNullOrWhiteSpace(rawBlock)) continue;
+
+            var block = NormalizeDocumentText(rawBlock);
+            if (string.IsNullOrWhiteSpace(block)) continue;
+
+            // TABLE
+            if (IsTableBlock(block))
             {
-                continue;
-            }
-
-            var block =
-                NormalizeDocumentText(
-                    rawBlock);
-
-            if (string.IsNullOrWhiteSpace(
-                block))
-            {
-                continue;
-            }
-
-            var separator =
-                currentParent.Length == 0
-                    ? string.Empty
-                    : Environment.NewLine +
-                      Environment.NewLine;
-
-            var candidateLength =
-                currentParent.Length +
-                separator.Length +
-                block.Length;
-
-            if (candidateLength <= chunkSize)
-            {
-                currentParent.Append(
-                    separator);
-
-                currentParent.Append(
-                    block);
-
-                continue;
-            }
-
-            if (currentParent.Length > 0)
-            {
-                parentChunks.Add(
-                    currentParent
-                        .ToString()
-                        .Trim());
-
-                currentParent.Clear();
-            }
-
-            if (block.Length <= chunkSize)
-            {
-                currentParent.Append(
-                    block);
-
-                continue;
-            }
-
-            var largeBlocks =
-                SplitLargeBlock(
-                    block,
-                    chunkSize);
-
-            for (var i = 0;
-                 i < largeBlocks.Count - 1;
-                 i++)
-            {
-                parentChunks.Add(
-                    largeBlocks[i]);
-            }
-
-            if (largeBlocks.Count > 0)
-            {
-                currentParent.Append(
-                    largeBlocks[^1]);
-            }
-        }
-
-        if (currentParent.Length > 0)
-        {
-            parentChunks.Add(
-                currentParent
-                    .ToString()
-                    .Trim());
-        }
-
-        return parentChunks;
-    }
-
-    private static List<string> SplitLargeBlock(
-        string text,
-        int chunkSize)
-    {
-        var result =
-            new List<string>();
-
-        var paragraphs =
-            text.Split(
-                new[]
+                if (currentWords.Count > 0)
                 {
-                    "\r\n\r\n",
-                    "\n\n"
-                },
-                StringSplitOptions.RemoveEmptyEntries);
+                    chunks.Add(string.Join(" ", currentWords));
+                    currentWords.Clear();
+                    currentLength = 0;
+                }
 
-        var current =
-            new StringBuilder();
+                var tableChunks = BuildTableChunks(block, chunkSize, overlapSize);
+                chunks.AddRange(tableChunks);
 
-        foreach (var paragraph in paragraphs)
-        {
-            var cleanParagraph =
-                paragraph.Trim();
-
-            if (string.IsNullOrWhiteSpace(
-                cleanParagraph))
-            {
+                var tableWords = block.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                var ov = tableWords.Skip(Math.Max(0, tableWords.Length - 5)).ToList();
+                currentWords = ov;
+                currentLength = ov.Sum(w => w.Length + 1);
                 continue;
             }
 
-            var separator =
-                current.Length == 0
-                    ? string.Empty
-                    : Environment.NewLine +
-                      Environment.NewLine;
-
-            if (current.Length +
-                separator.Length +
-                cleanParagraph.Length <=
-                chunkSize)
-            {
-                current.Append(
-                    separator);
-
-                current.Append(
-                    cleanParagraph);
-
-                continue;
-            }
-
-            if (current.Length > 0)
-            {
-                result.Add(
-                    current
-                        .ToString()
-                        .Trim());
-
-                current.Clear();
-            }
-
-            if (cleanParagraph.Length <=
-                chunkSize)
-            {
-                current.Append(
-                    cleanParagraph);
-
-                continue;
-            }
-
-            var words =
-                cleanParagraph.Split(
-                    ' ',
-                    StringSplitOptions.RemoveEmptyEntries);
+            // NORMAL BLOCK — word-based
+            var words = block.Split(' ', StringSplitOptions.RemoveEmptyEntries);
 
             foreach (var word in words)
             {
-                var wordSeparator =
-                    current.Length == 0
-                        ? string.Empty
-                        : " ";
+                var wordLength = word.Length + 1;
 
-                if (current.Length +
-                    wordSeparator.Length +
-                    word.Length <=
-                    chunkSize)
+                if (currentLength + wordLength > chunkSize && currentWords.Count > 0)
                 {
-                    current.Append(
-                        wordSeparator);
+                    chunks.Add(string.Join(" ", currentWords));
 
-                    current.Append(
-                        word);
-                }
-                else
-                {
-                    if (current.Length > 0)
+                    var ov = new List<string>();
+                    var ovLen = 0;
+                    for (int i = currentWords.Count - 1; i >= 0; i--)
                     {
-                        result.Add(
-                            current
-                                .ToString()
-                                .Trim());
-
-                        current.Clear();
+                        var w = currentWords[i].Length + 1;
+                        if (ovLen + w > overlapSize) break;
+                        ov.Insert(0, currentWords[i]);
+                        ovLen += w;
                     }
-
-                    current.Append(word);
+                    currentWords = ov;
+                    currentLength = ovLen;
                 }
+
+                currentWords.Add(word);
+                currentLength += wordLength;
             }
         }
 
-        if (current.Length > 0)
+        if (currentWords.Count > 0)
+            chunks.Add(string.Join(" ", currentWords));
+
+        return chunks;
+    }
+
+    private static List<string> BuildTableChunks(
+        string tableBlock,
+        int chunkSize,
+        int overlapSize)
+    {
+        var chunks = new List<string>();
+
+        var lines = tableBlock
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(l => l.TrimEnd())
+            .Where(l => !string.IsNullOrWhiteSpace(l))
+            .ToList();
+
+        if (lines.Count < 2)
         {
-            result.Add(
-                current
+            chunks.Add(tableBlock);
+            return chunks;
+        }
+
+        var headerLine = lines[0];
+        var separatorLine = lines.Count > 1 ? lines[1] : string.Empty;
+        var headerPrefix = headerLine + "\n" + separatorLine + "\n";
+
+        var dataRows = lines.Skip(2).ToList();
+
+        if (dataRows.Count == 0 || tableBlock.Length <= chunkSize)
+        {
+            chunks.Add(tableBlock);
+            return chunks;
+        }
+
+        var current = new StringBuilder();
+        current.Append(headerPrefix);
+        var currentLength = headerPrefix.Length;
+
+        foreach (var row in dataRows)
+        {
+            var rowLength = row.Length + 1;
+
+            if (currentLength + rowLength > chunkSize &&
+                currentLength > headerPrefix.Length)
+            {
+                chunks.Add(current.ToString().Trim());
+
+                var currentLines = current
                     .ToString()
-                    .Trim());
+                    .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                    .Skip(2)
+                    .ToList();
+
+                var ovRows = new List<string>();
+                var ovLen = 0;
+                for (int i = currentLines.Count - 1; i >= 0; i--)
+                {
+                    var ll = currentLines[i].Length + 1;
+                    if (ovLen + ll > overlapSize) break;
+                    ovRows.Insert(0, currentLines[i]);
+                    ovLen += ll;
+                }
+
+                current.Clear();
+                current.Append(headerPrefix);
+                currentLength = headerPrefix.Length;
+
+                foreach (var ovRow in ovRows)
+                {
+                    current.AppendLine(ovRow);
+                    currentLength += ovRow.Length + 1;
+                }
+            }
+
+            current.AppendLine(row);
+            currentLength += rowLength;
         }
 
-        return result;
+        if (current.Length > headerPrefix.Length)
+            chunks.Add(current.ToString().Trim());
+
+        return chunks;
     }
 
-    private static string NormalizeInlineText(
-        string text)
+    private static bool IsTableBlock(string block)
     {
-        if (string.IsNullOrWhiteSpace(text))
-        {
-            return string.Empty;
-        }
-
-        text = text
-            .Replace("\r\n", "\n")
-            .Replace("\r", "\n");
-
-        var lines =
-            text.Split('\n')
-                .Select(line =>
-                    string.Join(
-                        " ",
-                        line.Split(
-                            ' ',
-                            StringSplitOptions
-                                .RemoveEmptyEntries)))
-                .Where(line =>
-                    !string.IsNullOrWhiteSpace(
-                        line));
-
-        return string.Join(
-            " ",
-            lines).Trim();
+        if (string.IsNullOrWhiteSpace(block)) return false;
+        var lines = block.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        if (lines.Length < 2) return false;
+        int tableLines = lines.Count(l => l.TrimStart().StartsWith("|"));
+        return tableLines >= lines.Length * 0.6;
     }
 
-    private static string NormalizeDocumentText(
-        string text)
+    // FIX #3: NormalizeInlineText — lines joined by SPACE
+    private static string NormalizeInlineText(string text)
     {
-        if (string.IsNullOrWhiteSpace(text))
-        {
-            return string.Empty;
-        }
+        if (string.IsNullOrWhiteSpace(text)) return string.Empty;
 
-        text = text
-            .Replace("\r\n", "\n")
-            .Replace("\r", "\n");
+        text = text.Replace("\r\n", "\n").Replace("\r", "\n");
 
-        var lines =
-            text.Split('\n')
-                .Select(line => line.Trim())
-                .Where(line =>
-                    !string.IsNullOrWhiteSpace(
-                        line));
+        var lines = text.Split('\n')
+            .Select(line => line.Trim())
+            .Where(line => !string.IsNullOrWhiteSpace(line));
 
-        return string.Join(
-            Environment.NewLine,
-            lines);
+        return string.Join(" ", lines).Trim();
+    }
+
+    private static string NormalizeDocumentText(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return string.Empty;
+
+        text = text.Replace("\r\n", "\n").Replace("\r", "\n");
+
+        var lines = text.Split('\n')
+            .Select(line => line.Trim())
+            .Where(line => !string.IsNullOrWhiteSpace(line));
+
+        return string.Join(Environment.NewLine, lines);
     }
 }

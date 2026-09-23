@@ -1,4 +1,6 @@
 ﻿using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Configuration;
+using Rag.DocumentProcessing.Configuration;
 using Rag.EmbeddingGenerator.Interfaces;
 using Rag.EmbeddingGenerator.Readers;
 using Rag.EmbeddingGenerator.Services;
@@ -6,6 +8,14 @@ using Rag.VectorStore.Interfaces;
 using Rag.VectorStore.Services;
 
 var services = new ServiceCollection();
+var configuration = new ConfigurationBuilder()
+    .SetBasePath(AppContext.BaseDirectory)
+    .AddJsonFile("appsettings.json", optional: false, reloadOnChange: false)
+    .Build();
+
+services.AddSingleton<IConfiguration>(configuration);
+services.AddOptions<DocumentProcessingOptions>()
+    .Bind(configuration.GetSection("RagPaths"));
 
 services.AddSingleton<IChunkReader, JsonChunkReader>();
 services.AddHttpClient<IEmbeddingGenerator, OllamaEmbeddingGenerator>();
@@ -33,7 +43,11 @@ foreach (var chunk in chunks)
     Console.WriteLine(
         $"Embedding Document {chunk.DocumentId} - Chunk {chunk.ChunkNumber}");
 
-    var vector = await generator.GenerateAsync(chunk.Text);
+    var textForEmbedding = string.IsNullOrWhiteSpace(chunk.Text)
+        ? chunk.ContextualText
+        : chunk.Text;
+
+    var vector = await generator.GenerateAsync(textForEmbedding);
 
     if (vector.Length != 384)
     {
@@ -44,13 +58,18 @@ foreach (var chunk in chunks)
     Console.WriteLine($"Vector dimensions: {vector.Length}");
 
     await vectorStore.UpsertAsync(
-        id,
-        vector,
-        chunk.Text,
-        chunk.ParentText,
-        chunk.DocumentName,
-        chunk.ChunkNumber,
-        chunk.DocumentId);
+    id,
+    vector,
+    chunk.ContextualText,
+    chunk.ParentText,
+    chunk.DocumentName,
+    chunk.ChunkNumber,
+    chunk.DocumentId,
+    chunk.DocumentType,
+    fileType: Path.GetExtension(chunk.RelativePath)
+        .TrimStart('.')
+        .ToLowerInvariant(),
+    relativePath: chunk.RelativePath);
 
     Console.WriteLine($"Stored vector {id}");
 

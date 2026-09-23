@@ -9,4 +9,5 @@ public class DocumentChunk
     public int ChunkNumber { get; set; }
     public string Text { get; set; } = string.Empty;
     public string ParentText { get; set; } = string.Empty;
+    public string ContextualText { get; set; } = string.Empty;
 }

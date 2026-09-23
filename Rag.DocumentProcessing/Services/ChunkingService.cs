@@ -16,39 +16,34 @@ public class ChunkingService : IChunkingService
     {
         var chunks = new List<DocumentChunk>();
 
-        if (string.IsNullOrWhiteSpace(content))
+        if (string.IsNullOrWhiteSpace(content) || maxChunkSize <= 0)
             return chunks;
 
-        // Split text cleanly into sentences using punctuation boundaries
-        var rawSentences = Regex.Split(content, @"(?<=[.!?])\s+|\r?\n");
-        var builder = new StringBuilder();
+        var words = Regex.Matches(content, @"\S+")
+            .Cast<Match>()
+            .Select(match => match.Value)
+            .ToList();
+
+        if (words.Count == 0)
+            return chunks;
+
+        var currentWords = new List<string>();
         var chunkNumber = 1;
 
-        foreach (var sentence in rawSentences)
+        foreach (var word in words)
         {
-            var trimmedSentence = sentence.Trim();
-            if (string.IsNullOrEmpty(trimmedSentence))
-                continue;
-
-            // If adding the next sentence exceeds the max chunk size, save the current chunk
-            if (builder.Length > 0 && builder.Length + trimmedSentence.Length + 1 > maxChunkSize)
+            if (currentWords.Count > 0 && currentWords.Count + 1 > maxChunkSize)
             {
-                chunks.Add(CreateNewChunk(documentInfo, chunkNumber++, builder.ToString(), string.Empty));
-                builder.Clear();
+                chunks.Add(CreateNewChunk(documentInfo, chunkNumber++, string.Join(" ", currentWords), string.Empty));
+                currentWords.Clear();
             }
 
-            if (builder.Length > 0)
-            {
-                builder.Append(' ');
-            }
-
-            builder.Append(trimmedSentence);
+            currentWords.Add(word);
         }
 
-        // Add any remaining text as the final chunk
-        if (builder.Length > 0)
+        if (currentWords.Count > 0)
         {
-            chunks.Add(CreateNewChunk(documentInfo, chunkNumber, builder.ToString(), string.Empty));
+            chunks.Add(CreateNewChunk(documentInfo, chunkNumber, string.Join(" ", currentWords), string.Empty));
         }
 
         return chunks;
@@ -80,18 +75,24 @@ public class ChunkingService : IChunkingService
 
         foreach (var parentText in content)
         {
-            if (string.IsNullOrWhiteSpace(parentText)) continue;
+            if (string.IsNullOrWhiteSpace(parentText) || childChunkSize <= 0)
+                continue;
 
-            int currentIndex = 0;
+            var words = Regex.Matches(parentText, @"\S+")
+                .Cast<Match>()
+                .Select(match => match.Value)
+                .ToList();
 
-            // Slide across the parent text using character indices
-            while (currentIndex < parentText.Length)
+            if (words.Count == 0)
+                continue;
+
+            var currentIndex = 0;
+
+            while (currentIndex < words.Count)
             {
-                // Determine the length of the current chunk
-                int length = Math.Min(childChunkSize, parentText.Length - currentIndex);
-
-                // Extract the child text chunk
-                string childText = parentText.Substring(currentIndex, length).Trim();
+                var length = Math.Min(childChunkSize, words.Count - currentIndex);
+                var childWords = words.Skip(currentIndex).Take(length).ToList();
+                var childText = string.Join(" ", childWords).Trim();
 
                 if (!string.IsNullOrEmpty(childText))
                 {
@@ -99,14 +100,12 @@ public class ChunkingService : IChunkingService
                     globalChunkNumber++;
                 }
 
-                // If we reached the end of the parent string, break out of the loop
-                if (currentIndex + childChunkSize >= parentText.Length)
+                if (currentIndex + childChunkSize >= words.Count)
                 {
                     break;
                 }
 
-                // Move forward by chunk size minus the overlap
-                currentIndex += (childChunkSize - overlap);
+                currentIndex += Math.Max(1, childChunkSize - overlap);
             }
         }
 

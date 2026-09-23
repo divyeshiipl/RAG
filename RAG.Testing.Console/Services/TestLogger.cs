@@ -6,13 +6,19 @@ public class TestLogger
 {
     private readonly string _logFilePath;
 
-    public TestLogger(string logFilePath = @"C:\Dev\RAG RND\Logs\ResultLogs\rag_execution_history.log")
+    public TestLogger(string logFilePath)
     {
         _logFilePath = logFilePath;
     }
 
     public async Task AppendTestResultAsync(string question, string answer, long elapsedMs)
     {
+        var directory = Path.GetDirectoryName(_logFilePath);
+        if (!string.IsNullOrWhiteSpace(directory))
+        {
+            Directory.CreateDirectory(directory);
+        }
+
         var sb = new StringBuilder();
 
         sb.AppendLine("================================================================================");
