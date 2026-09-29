@@ -1,6 +1,7 @@
 ﻿using System.Text.Json;
 using Microsoft.Extensions.Options;
 using Rag.DocumentProcessing.Configuration;
+using Rag.DocumentProcessing.Constants;
 using Rag.DocumentProcessing.Interfaces;
 using Rag.DocumentProcessing.Models;
 
@@ -74,7 +75,8 @@ public class JsonChunkStorage : IChunkStorage
                 RelativePath = document.RelativePath,
                 FileHash = contentHash,
                 ProcessedOn = DateTime.Now,
-                TotalChunks = chunkList.Count
+                TotalChunks = chunkList.Count,
+                ChunkingVersion = DocumentConstants.ChunkingVersion
             };
 
         var metadataPath =

@@ -6,8 +6,8 @@ namespace Rag.EmbeddingGenerator.Services;
 
 public class OllamaEmbeddingGenerator : IEmbeddingGenerator
 {
-    private const int MaxWordsForModel = 160;
-    private const int MaxCharsForModel = 3000;
+    private const int MaxWordsForModel = 100;
+    private const int MaxCharsForModel = 2000;
     private const int ModelContextSize = 512;
     private readonly HttpClient _httpClient;
 
@@ -32,6 +32,7 @@ public class OllamaEmbeddingGenerator : IEmbeddingGenerator
             model = "all-minilm",
             prompt = safeText,
             truncate = true,
+            keep_alive = "30m",
             options = new
             {
                 num_ctx = ModelContextSize

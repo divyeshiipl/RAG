@@ -43,9 +43,7 @@ foreach (var chunk in chunks)
     Console.WriteLine(
         $"Embedding Document {chunk.DocumentId} - Chunk {chunk.ChunkNumber}");
 
-    var textForEmbedding = string.IsNullOrWhiteSpace(chunk.Text)
-        ? chunk.ContextualText
-        : chunk.Text;
+    var textForEmbedding = chunk.ContextualText;
 
     var vector = await generator.GenerateAsync(textForEmbedding);
 
@@ -69,7 +67,10 @@ foreach (var chunk in chunks)
     fileType: Path.GetExtension(chunk.RelativePath)
         .TrimStart('.')
         .ToLowerInvariant(),
-    relativePath: chunk.RelativePath);
+    relativePath: chunk.RelativePath,
+    tableId: chunk.TableId,
+    parentBlockId: chunk.ParentBlockId,
+    tableContext: chunk.TableContext);
 
     Console.WriteLine($"Stored vector {id}");
 
@@ -79,4 +80,3 @@ foreach (var chunk in chunks)
 
 Console.WriteLine();
 Console.WriteLine("All embeddings stored in Qdrant.");
-Console.ReadKey();

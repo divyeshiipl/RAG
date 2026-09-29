@@ -13,4 +13,6 @@ public class ProcessingMetadata
     public DateTime ProcessedOn { get; set; }
 
     public int TotalChunks { get; set; }
+
+    public int ChunkingVersion { get; set; }
 }

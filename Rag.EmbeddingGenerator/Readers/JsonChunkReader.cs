@@ -53,22 +53,6 @@ public class JsonChunkReader : IChunkReader
             chunks.Add(chunk);
         }
 
-        foreach (var chunk in chunks)
-        {
-            var file = files.FirstOrDefault(f =>
-                f.Contains($"chunk-{chunk.ChunkNumber:D3}.json"));
-
-            if (string.IsNullOrEmpty(file))
-                continue;
-
-            var updatedJson = JsonSerializer.Serialize(chunk, new JsonSerializerOptions
-            {
-                WriteIndented = true
-            });
-
-            await File.WriteAllTextAsync(file, updatedJson, cancellationToken);
-        }
-
         return chunks
             .OrderBy(x => x.DocumentId)
             .ThenBy(x => x.ChunkNumber)

@@ -68,7 +68,8 @@ foreach (var document in DocumentRepository.Documents)
             document.DocumentId);
 
     if (existingMetadata != null &&
-        existingMetadata.FileHash == currentHash)
+        existingMetadata.FileHash == currentHash &&
+        existingMetadata.ChunkingVersion == DocumentConstants.ChunkingVersion)
     {
         Console.WriteLine(
             "Document unchanged. Skipping.");
@@ -152,5 +153,3 @@ foreach (var processedDocument in processedDocuments)
 }
 
 Console.WriteLine("Document processing completed.");
-
-Console.ReadKey();

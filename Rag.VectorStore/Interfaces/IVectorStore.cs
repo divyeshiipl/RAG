@@ -17,6 +17,9 @@ public interface IVectorStore
         string documentType = "",
         string fileType = "",
         string relativePath = "",
+        string tableId = "",
+        string parentBlockId = "",
+        string tableContext = "",
         int? pageNumber = null,
         string? sheetName = null,
         string? sqlObjectType = null);
@@ -25,4 +28,6 @@ public interface IVectorStore
         float[] queryVector,
         string queryText,      
         int limit = 5);
+
+    Task<IReadOnlyList<VectorSearchResult>> GetDocumentChunksAsync(string documentId);
 }

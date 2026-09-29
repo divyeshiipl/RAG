@@ -10,4 +10,7 @@ public class DocumentChunk
     public string Text { get; set; } = string.Empty;
     public string ParentText { get; set; } = string.Empty;
     public string ContextualText { get; set; } = string.Empty;
+    public string TableId { get; set; } = string.Empty;
+    public string ParentBlockId { get; set; } = string.Empty;
+    public string TableContext { get; set; } = string.Empty;
 }

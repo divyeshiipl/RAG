@@ -14,6 +14,9 @@ public class VectorSearchResult
 
     public string Text { get; set; } = string.Empty;
     public string ParentText { get; set; } = string.Empty;
+    public string TableId { get; set; } = string.Empty;
+    public string ParentBlockId { get; set; } = string.Empty;
+    public string TableContext { get; set; } = string.Empty;
 
     public string DocumentType { get; set; } = string.Empty;
     public string FileType { get; set; } = string.Empty;
@@ -21,5 +24,10 @@ public class VectorSearchResult
     public int? PageNumber { get; set; }
     public string? SheetName { get; set; }
     public string? SqlObjectType { get; set; }
+
+    public string SectionTitle { get; set; } = string.Empty;
+    public int SectionStartChunk { get; set; }
+    public int SectionEndChunk { get; set; }
+    public string SectionKey { get; set; } = string.Empty;
 
 }
