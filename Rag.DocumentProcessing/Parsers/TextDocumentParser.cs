@@ -29,19 +29,6 @@ public class TextDocumentParser : IDocumentParser
             return string.Empty;
         }
 
-        if (!HasDocumentTitle(content))
-        {
-            var fileName =
-                Path.GetFileNameWithoutExtension(
-                    filePath);
-
-            content =
-                $"Document: {fileName}" +
-                Environment.NewLine +
-                Environment.NewLine +
-                content;
-        }
-
         return content;
     }
 
@@ -69,19 +56,6 @@ public class TextDocumentParser : IDocumentParser
         if (string.IsNullOrWhiteSpace(content))
         {
             return new List<string>();
-        }
-
-        if (!HasDocumentTitle(content))
-        {
-            var fileName =
-                Path.GetFileNameWithoutExtension(
-                    filePath);
-
-            content =
-                $"Document: {fileName}" +
-                Environment.NewLine +
-                Environment.NewLine +
-                content;
         }
 
         var blocks =
@@ -126,14 +100,6 @@ public class TextDocumentParser : IDocumentParser
                 continue;
             }
 
-            if (IsHeading(line) &&
-                currentBlock.Length > 0)
-            {
-                AddCurrentBlock(
-                    blocks,
-                    currentBlock);
-            }
-
             if (currentBlock.Length > 0)
             {
                 currentBlock.AppendLine();
@@ -141,12 +107,6 @@ public class TextDocumentParser : IDocumentParser
 
             currentBlock.Append(line);
 
-            if (IsHeading(line))
-            {
-                AddCurrentBlock(
-                    blocks,
-                    currentBlock);
-            }
         }
 
         AddCurrentBlock(
@@ -432,68 +392,6 @@ public class TextDocumentParser : IDocumentParser
                 start += length;
             }
         }
-    }
-
-    private static bool HasDocumentTitle(
-        string content)
-    {
-        var firstNonEmptyLine =
-            content
-                .Split(
-                    new[] { "\r\n", "\n", "\r" },
-                    StringSplitOptions.RemoveEmptyEntries)
-                .Select(line => line.Trim())
-                .FirstOrDefault();
-
-        if (string.IsNullOrWhiteSpace(
-            firstNonEmptyLine))
-        {
-            return false;
-        }
-
-        return IsHeading(
-            firstNonEmptyLine);
-    }
-
-    private static bool IsHeading(
-        string line)
-    {
-        if (string.IsNullOrWhiteSpace(line))
-        {
-            return false;
-        }
-
-        var value =
-            line.Trim();
-
-        if (value.StartsWith("#"))
-        {
-            return true;
-        }
-
-        if (value.Length <= 120 &&
-            value.EndsWith(":"))
-        {
-            return true;
-        }
-
-        if (value.Length <= 120 &&
-            value.StartsWith(
-                "Chapter ",
-                StringComparison.OrdinalIgnoreCase))
-        {
-            return true;
-        }
-
-        if (value.Length <= 120 &&
-            value.StartsWith(
-                "Section ",
-                StringComparison.OrdinalIgnoreCase))
-        {
-            return true;
-        }
-
-        return false;
     }
 
     private static string NormalizeDocumentText(

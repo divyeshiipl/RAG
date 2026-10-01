@@ -337,12 +337,6 @@ public class ChunkingService : IChunkingService
             .Select(cell => cell.Trim())
             .LastOrDefault() ?? candidate;
 
-        var numberedHeading = Regex.Match(
-            lastCell,
-            @"^\d+(?:\.\d+)*\.?\s+\S+(?:\s+\S+){0,2}");
-        if (numberedHeading.Success)
-            return numberedHeading.Value;
-
         if (lastCell.Length <= 80 &&
             CountWords(lastCell) <= 8 &&
             !IsMarkdownTable(lastCell))

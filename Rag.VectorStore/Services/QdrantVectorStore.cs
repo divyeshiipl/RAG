@@ -1,4 +1,4 @@
-using Qdrant.Client;
+﻿using Qdrant.Client;
 using Qdrant.Client.Grpc;
 using Rag.VectorStore.Interfaces;
 using Rag.VectorStore.Models;
@@ -249,22 +249,7 @@ public class QdrantVectorStore : IVectorStore
                 + (identifierMatches.Contains(candidate.Id) ? 10000 : 0));
         }
 
-        // ---------- STAGE 2: SECTION SCOPING ----------
-
-        var scope = DetectRelevantScope(queryText, candidateResults);
-
-        if (scope == null)
-        {
-            scope = InferDominantScope(candidateResults);
-        }
-
-        if (scope != null)
-        {
-            var sectionChunks = await ResolveSectionChunksAsync(scope);
-            candidateResults = MergeSectionChunks(candidateResults, sectionChunks);
-        }
-
-        var selected = SelectMinimumChunks(queryText, candidateResults, scope);
+        var selected = SelectMinimumChunks(queryText, candidateResults);
 
         var selectedTableIds = selected
             .Where(r => !string.IsNullOrWhiteSpace(r.TableId))
@@ -327,401 +312,21 @@ public class QdrantVectorStore : IVectorStore
     }
 
     // =================================================================
-    // SCOPE DETECTION
-    // =================================================================
-
-    private sealed class SectionScope
-    {
-        public string DocumentId { get; init; } = string.Empty;
-        public string SectionTitle { get; init; } = string.Empty;
-        public string SectionKey { get; init; } = string.Empty;
-        public string HeadingNumber { get; init; } = string.Empty;
-        public int HeadingLevel { get; init; }
-    }
-
-    private sealed class HeadingInfo
-    {
-        public string DocumentId { get; init; } = string.Empty;
-        public string Title { get; init; } = string.Empty;
-        public string Number { get; init; } = string.Empty;
-        public int Level { get; init; }
-        public int ChunkNumber { get; init; }
-    }
-
-    private static SectionScope? DetectRelevantScope(
-    string queryText,
-    IReadOnlyList<VectorSearchResult> candidates)
-    {
-        if (candidates.Count == 0)
-            return null;
-
-        // NEW: If the query explicitly mentions a table, or refers to a row
-        // inside a table, don't scope by section — let table expansion work.
-        var q = queryText.ToLowerInvariant();
-        if (Regex.IsMatch(q, @"\btable\b"))
-            return null;
-
-        // NEW: If the top candidates themselves are table chunks, skip scoping.
-        var topByScore = candidates
-            .OrderByDescending(c => c.Score)
-            .Take(5)
-            .ToList();
-
-        if (topByScore.Any(c => !string.IsNullOrWhiteSpace(c.TableId)))
-            return null;
-
-        var query = NormalizeForSearch(queryText);
-
-        var headings = candidates
-            .Where(c => !string.IsNullOrWhiteSpace(c.DocumentId))
-            .SelectMany(ExtractHeadings)
-            .GroupBy(h => $"{h.DocumentId}|{h.Number}|{h.Title}",
-                StringComparer.OrdinalIgnoreCase)
-            .Select(g => g.First())
-            .ToList();
-
-        if (headings.Count == 0)
-            return null;
-
-        var queryTerms = Tokenize(queryText)
-            .Where(t => t.Length >= 2 || t.Any(char.IsDigit))
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-        var scored = headings
-            .Select(h => new
-            {
-                Heading = h,
-                Score = ScoreHeadingMatch(h.Title, queryTerms, query)
-            })
-            .Where(x => x.Score > 0)
-            .OrderByDescending(x => x.Score)
-            .ToList();
-
-        if (scored.Count == 0)
-            return null;
-
-        // Require a meaningful margin over the second-best heading, otherwise
-        // we're guessing — better to fall back to global ranking.
-        if (scored.Count > 1 && scored[1].Score >= scored[0].Score * 0.9)
-            return null;
-
-        return BuildScope(scored[0].Heading);
-    }
-
-    private static SectionScope? InferDominantScope(
-    IReadOnlyList<VectorSearchResult> candidates)
-    {
-        // Skip inference if the top candidate is a table chunk.
-        var top = candidates
-            .OrderByDescending(c => c.Score)
-            .FirstOrDefault(c => !string.IsNullOrWhiteSpace(c.DocumentId));
-
-        if (top == null)
-            return null;
-
-        if (!string.IsNullOrWhiteSpace(top.TableId))
-            return null;
-
-        var ownHeading = ExtractHeadings(top)
-            .OrderBy(h => h.Level)
-            .FirstOrDefault();
-
-        if (ownHeading != null)
-            return BuildScope(ownHeading);
-
-        var parentHeading = ExtractHeadingsFromText(
-            top.ParentText, top.DocumentId, top.ChunkNumber)
-            .OrderBy(h => h.Level)
-            .FirstOrDefault();
-
-        if (parentHeading != null)
-            return BuildScope(parentHeading);
-
-        return null;
-    }
-
-    private static SectionScope BuildScope(HeadingInfo heading)
-    {
-        return new SectionScope
-        {
-            DocumentId = heading.DocumentId,
-            SectionTitle = heading.Title,
-            SectionKey = $"{heading.DocumentId}|{heading.Number}|{heading.Title}",
-            HeadingNumber = heading.Number,
-            HeadingLevel = heading.Level
-        };
-    }
-
-    private static IEnumerable<HeadingInfo> ExtractHeadings(
-        VectorSearchResult c)
-    {
-        foreach (var h in ExtractHeadingsFromText(
-            c.Text, c.DocumentId, c.ChunkNumber))
-            yield return h;
-
-        foreach (var h in ExtractHeadingsFromText(
-            c.ParentText, c.DocumentId, c.ChunkNumber))
-            yield return h;
-    }
-
-    private static IEnumerable<HeadingInfo> ExtractHeadingsFromText(
-        string? text,
-        string documentId,
-        int chunkNumber)
-    {
-        if (string.IsNullOrWhiteSpace(text))
-            yield break;
-
-        // Find "N. " or "N.M. " at a sentence boundary (start of text,
-        // after newline, after ". ", "; ", "• ").
-        var numberPattern = @"(?:^|[\r\n]|[\.;•\u2022]\s+)(\d+(?:\.\d+)*)\.\s+";
-
-        foreach (RegexMatch m in Regex.Matches(text, numberPattern))
-        {
-            var number = m.Groups[1].Value;
-            var titleStart = m.Index + m.Length;
-
-            var remaining = text.Length - titleStart;
-            if (remaining <= 0) continue;
-
-            var length = Math.Min(200, remaining);
-            var raw = text.Substring(titleStart, length);
-
-            // Stop the title at a bullet, next numbered heading, or newline.
-            var titleMatch = Regex.Match(
-                raw,
-                @"^(?<title>[A-Z][A-Za-z0-9 \-/&:']{1,100}?)(?=\s*[\r\n]|\s+[-•\u2022]\s|\s+\d+\.\s)");
-
-            string title;
-            if (titleMatch.Success)
-            {
-                title = titleMatch.Groups["title"].Value.Trim();
-            }
-            else
-            {
-                // Fallback: stop before a following capitalised word.
-                var fallback = Regex.Match(
-                    raw,
-                    @"^[A-Z][A-Za-z0-9 \-/&:']{1,80}?(?=\s+[A-Z][a-z])");
-
-                title = fallback.Success
-                    ? fallback.Value.Trim()
-                    : string.Join(" ", raw.Split(' ').Take(5));
-            }
-
-            title = title.TrimEnd('-', ' ', ':');
-            if (string.IsNullOrWhiteSpace(title)) continue;
-
-            yield return new HeadingInfo
-            {
-                DocumentId = documentId,
-                ChunkNumber = chunkNumber,
-                Number = number,
-                Title = $"{number}. {title}",
-                Level = number.Count(ch => ch == '.') + 1
-            };
-        }
-    }
-
-    private static int ScoreHeadingMatch(
-        string heading,
-        HashSet<string> queryTerms,
-        string normalizedQuery)
-    {
-        var headingTerms = Tokenize(heading).ToList();
-        if (headingTerms.Count == 0) return 0;
-
-        int score = 0;
-        foreach (var term in headingTerms)
-        {
-            if (queryTerms.Contains(term))
-                score += term.Any(char.IsDigit) ? 10 : 3;
-        }
-
-        var normalizedHeading = NormalizeForSearch(heading);
-        if (!string.IsNullOrWhiteSpace(normalizedHeading) &&
-            normalizedQuery.Contains(normalizedHeading, StringComparison.OrdinalIgnoreCase))
-        {
-            score += 50;
-        }
-
-        return score;
-    }
-
-    // =================================================================
-    // SECTION RESOLUTION (offset-based)
-    // =================================================================
-
-    /// <summary>
-    /// Concatenates all chunks of the document, finds the section start
-    /// and end offsets with regex, and maps the range back to chunks.
-    /// </summary>
-    private async Task<List<VectorSearchResult>> ResolveSectionChunksAsync(
-        SectionScope scope)
-    {
-        var documentChunks = await GetDocumentChunksAsync(scope.DocumentId);
-
-        if (documentChunks.Count == 0)
-            return new List<VectorSearchResult>();
-
-        // Concatenate all chunks with a chunk -> offset map.
-        var sb = new StringBuilder();
-        var chunkOffsets = new List<(int Offset, int Length, VectorSearchResult Chunk)>();
-
-        foreach (var c in documentChunks)
-        {
-            var text = c.Text ?? string.Empty;
-            chunkOffsets.Add((sb.Length, text.Length, c));
-            sb.Append(text);
-            sb.Append('\n');
-        }
-
-        var fullText = sb.ToString();
-
-        var headingNumber = scope.HeadingNumber;
-        if (string.IsNullOrWhiteSpace(headingNumber))
-            return new List<VectorSearchResult>();
-
-        // Build "N.\s+Word1\s+Word2\s+Word3" from the section title.
-        var titleWords = Regex
-            .Split(scope.SectionTitle ?? string.Empty, @"\s+")
-            .Where(w => !string.IsNullOrWhiteSpace(w))
-            .Where(w => !Regex.IsMatch(w.Trim(), @"^\d+\.?$"))
-            .Select(w => w.Trim())
-            .Take(3)
-            .Select(Regex.Escape)
-            .ToList();
-
-        if (titleWords.Count == 0)
-            return new List<VectorSearchResult>();
-
-        var startPattern = $@"(?<!\d){Regex.Escape(headingNumber)}\.\s+" +
-                           string.Join(@"\s+", titleWords);
-
-        var startRegex = new Regex(startPattern, RegexOptions.IgnoreCase);
-        var startMatch = startRegex.Match(fullText);
-
-        if (!startMatch.Success)
-            return new List<VectorSearchResult>();
-
-        var startOffset = startMatch.Index;
-
-        // End pattern: (top-level number + 1) followed by a capital letter.
-        var topNumber = int.Parse(headingNumber.Split('.')[0]);
-        var endPattern = $@"(?<![\d.]){topNumber + 1}\.\s+[A-Z]";
-        var endRegex = new Regex(endPattern);
-
-        var endMatch = endRegex.Match(fullText, startOffset + startMatch.Length);
-        var endOffset = endMatch.Success ? endMatch.Index : fullText.Length;
-
-        // Map back to chunks whose spans overlap [startOffset, endOffset).
-        var selected = new List<VectorSearchResult>();
-
-        foreach (var (offset, length, chunk) in chunkOffsets)
-        {
-            var chunkEnd = offset + length;
-
-            if (chunkEnd <= startOffset) continue;
-            if (offset >= endOffset) break;
-
-            chunk.SectionTitle = scope.SectionTitle;
-            chunk.SectionKey = scope.SectionKey;
-            chunk.SectionStartChunk = offset;
-            chunk.SectionEndChunk = endOffset;
-            selected.Add(chunk);
-        }
-
-        return selected;
-    }
-
-    private static List<VectorSearchResult> MergeSectionChunks(
-    IReadOnlyList<VectorSearchResult> candidates,
-    IReadOnlyList<VectorSearchResult> sectionChunks)
-    {
-        if (sectionChunks.Count == 0)
-            return candidates.ToList();
-
-        var sectionIds = sectionChunks.Select(c => c.Id).ToHashSet();
-
-        var sectionMeta = sectionChunks.ToDictionary(
-            c => c.Id,
-            c => (c.SectionTitle, c.SectionKey,
-                  c.SectionStartChunk, c.SectionEndChunk));
-
-        var merged = new Dictionary<ulong, VectorSearchResult>();
-
-        // 1. In-scope candidates keep their scores.
-        foreach (var c in candidates.Where(c => sectionIds.Contains(c.Id)))
-        {
-            c.Score += 200;
-            if (sectionMeta.TryGetValue(c.Id, out var meta))
-            {
-                c.SectionTitle = meta.SectionTitle;
-                c.SectionKey = meta.SectionKey;
-                c.SectionStartChunk = meta.SectionStartChunk;
-                c.SectionEndChunk = meta.SectionEndChunk;
-            }
-            merged[c.Id] = c;
-        }
-
-        // 2. In-scope chunks that weren't candidates are added.
-        foreach (var s in sectionChunks)
-        {
-            if (!merged.ContainsKey(s.Id))
-                merged[s.Id] = s;
-        }
-
-        // 3. Out-of-scope candidates are retained if any of these is true:
-        //    (a) they carry an identifier match (score >= 10000)
-        //    (b) they belong to a table — tables are complete logical units
-        //    (c) their score is still competitive with the in-scope average
-        var inScopeAvg = sectionChunks.Count > 0
-            ? sectionChunks.Average(s => s.Score)
-            : 0;
-
-        foreach (var c in candidates.Where(c => !sectionIds.Contains(c.Id)))
-        {
-            var keep =
-                c.Score >= 10000 ||
-                !string.IsNullOrWhiteSpace(c.TableId) ||
-                c.Score >= inScopeAvg * 0.5;
-
-            if (keep)
-                merged[c.Id] = c;
-        }
-
-        return merged.Values.ToList();
-    }
-
-    // =================================================================
     // DYNAMIC MINIMUM CHUNK SELECTION
     // =================================================================
 
     private static List<VectorSearchResult> SelectMinimumChunks(
         string queryText,
-        IReadOnlyList<VectorSearchResult> candidates,
-        SectionScope? scope)
+        IReadOnlyList<VectorSearchResult> candidates)
     {
         if (candidates.Count == 0)
             return new List<VectorSearchResult>();
 
         var intent = DetectQueryIntent(queryText);
 
-        // WholeSection — return every in-scope chunk (no score cutoff)
+        // WholeSection — retain all retrieved chunks (no score cutoff).
         if (intent == QueryIntent.WholeSection)
         {
-            if (scope != null)
-            {
-                var scoped = candidates
-                    .Where(c => !string.IsNullOrWhiteSpace(c.SectionKey))
-                    .GroupBy(c => c.Id)
-                    .Select(g => g.First())
-                    .ToList();
-
-                if (scoped.Count > 0)
-                    return scoped;
-            }
-
             return candidates
                 .GroupBy(c => c.Id)
                 .Select(g => g.First())
@@ -767,26 +372,19 @@ public class QdrantVectorStore : IVectorStore
             return selected;
         }
 
-        // General intent — adaptive cutoff, prefer in-scope groups.
+        // General intent — adaptive cutoff across retrieved logical blocks.
         const double ratio = 0.55;
         const int maxUnits = 12;
 
         var cutoff = Math.Max(topScore * ratio, mean + stdDev * 0.25);
 
-        var scopedGroups = scope != null
-            ? groups.Where(g => g.Chunks.Any(c =>
-                !string.IsNullOrWhiteSpace(c.SectionKey))).ToList()
-            : groups;
-
-        var pool = scopedGroups.Count > 0 ? scopedGroups : groups;
-
-        var picked = pool
+        var picked = groups
             .Where(g => g.TopScore >= cutoff)
             .Take(maxUnits)
             .ToList();
 
         if (picked.Count == 0)
-            picked = pool.Take(1).ToList();
+            picked = groups.Take(1).ToList();
 
         var result = picked
             .SelectMany(g => g.Chunks)
@@ -794,23 +392,6 @@ public class QdrantVectorStore : IVectorStore
             .Select(g => g.First())
             .OrderByDescending(c => c.Score)
             .ToList();
-
-        // Continuation pull for split paragraphs.
-        var additional = new List<VectorSearchResult>();
-        foreach (var c in result)
-        {
-            if (string.IsNullOrWhiteSpace(c.SectionKey)) continue;
-
-            var next = candidates.FirstOrDefault(x =>
-                x.ChunkNumber == c.ChunkNumber + 1 &&
-                x.SectionKey == c.SectionKey &&
-                result.All(r => r.Id != x.Id));
-
-            if (next != null)
-                additional.Add(next);
-        }
-
-        result.AddRange(additional);
 
         return result
             .GroupBy(c => c.Id)

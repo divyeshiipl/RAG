@@ -25,9 +25,4 @@ public class VectorSearchResult
     public string? SheetName { get; set; }
     public string? SqlObjectType { get; set; }
 
-    public string SectionTitle { get; set; } = string.Empty;
-    public int SectionStartChunk { get; set; }
-    public int SectionEndChunk { get; set; }
-    public string SectionKey { get; set; } = string.Empty;
-
 }
