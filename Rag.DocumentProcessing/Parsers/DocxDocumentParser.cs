@@ -67,19 +67,19 @@ public class DocxDocumentParser : IDocumentParser
             return Task.FromResult(new List<string>());
 
         // Step 1: Collect blocks
-        var blocks = new List<string>();
+        var blocks = new List<DocumentBlock>();
 
         foreach (var element in body.Elements())
         {
             cancellationToken.ThrowIfCancellationRequested();
-
+            
             switch (element)
             {
                 case Paragraph paragraph:
                     {
                         var text = GetParagraphText(paragraph);
                         if (!string.IsNullOrWhiteSpace(text))
-                            blocks.Add(text);
+                            blocks.Add(new DocumentBlock { BlockContent = text, BlockType = "Paragraph" });
                         break;
                     }
 
@@ -87,7 +87,7 @@ public class DocxDocumentParser : IDocumentParser
                     {
                         var tableText = GetTableAsMarkdown(table);
                         if (!string.IsNullOrWhiteSpace(tableText))
-                            blocks.Add(tableText);
+                            blocks.Add(new DocumentBlock { BlockContent = tableText, BlockType = "Table" });
                         break;
                     }
             }
@@ -312,7 +312,7 @@ public class DocxDocumentParser : IDocumentParser
 
     // WORD-BASED CHUNKING (words NEVER break)
     private static List<string> BuildWordBasedChunks(
-        List<string> blocks,
+         List<DocumentBlock> blocks,
         int chunkSize,
         double overlapPercent = 0.20)
     {
@@ -327,13 +327,14 @@ public class DocxDocumentParser : IDocumentParser
 
         foreach (var rawBlock in blocks)
         {
-            if (string.IsNullOrWhiteSpace(rawBlock)) continue;
+            // Skip empty blocks. Already normalized in ParseAndChunkAsync.
+            //if (string.IsNullOrWhiteSpace(rawBlock)) continue;
 
-            var block = NormalizeDocumentText(rawBlock);
+            var block = NormalizeDocumentText(rawBlock.BlockContent);
             if (string.IsNullOrWhiteSpace(block)) continue;
 
             // TABLE
-            if (IsTableBlock(block))
+            if (rawBlock.BlockType == "Table")
             {
                 if (currentWords.Count > 0)
                 {
@@ -468,14 +469,14 @@ public class DocxDocumentParser : IDocumentParser
         return chunks;
     }
 
-    private static bool IsTableBlock(string block)
-    {
-        if (string.IsNullOrWhiteSpace(block)) return false;
-        var lines = block.Split('\n', StringSplitOptions.RemoveEmptyEntries);
-        if (lines.Length < 2) return false;
-        int tableLines = lines.Count(l => l.TrimStart().StartsWith("|"));
-        return tableLines >= lines.Length * 0.6;
-    }
+    //private static bool IsTableBlock(string block)
+    //{
+    //    if (string.IsNullOrWhiteSpace(block)) return false;
+    //    var lines = block.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+    //    if (lines.Length < 2) return false;
+    //    int tableLines = lines.Count(l => l.TrimStart().StartsWith("|"));
+    //    return tableLines >= lines.Length * 0.6;
+    //}
 
     // FIX #3: NormalizeInlineText — lines joined by SPACE
     private static string NormalizeInlineText(string text)
