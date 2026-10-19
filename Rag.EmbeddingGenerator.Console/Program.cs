@@ -70,7 +70,14 @@ foreach (var chunk in chunks)
     relativePath: chunk.RelativePath,
     tableId: chunk.TableId,
     parentBlockId: chunk.ParentBlockId,
-    tableContext: chunk.TableContext);
+    tableContext: chunk.TableContext,
+    sheetName: string.IsNullOrWhiteSpace(chunk.SheetName)
+        ? null
+        : chunk.SheetName,
+    rowStartIndex: chunk.RowStartIndex,
+    rowEndIndex: chunk.RowEndIndex,
+    rowIdentifiers: chunk.RowIdentifiers,
+    structuredRowsJson: chunk.StructuredRowsJson);
 
     Console.WriteLine($"Stored vector {id}");
 

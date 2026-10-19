@@ -3,6 +3,7 @@ using Rag.DocumentProcessing.Constants;
 using Rag.DocumentProcessing.Interfaces;
 using Rag.DocumentProcessing.Models;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Security.Cryptography;
 
@@ -135,6 +136,221 @@ public class ChunkingService : IChunkingService
         return chunks;
     }
 
+    public IReadOnlyList<DocumentChunk> CreateExcelTableChunks(
+        DocumentInfo documentInfo,
+        IReadOnlyList<ExcelTableBlock> tables,
+        int maxChunkWords = DocumentConstants.ChildChunkSize)
+    {
+        if (maxChunkWords <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maxChunkWords));
+
+        var chunks = new List<DocumentChunk>();
+        var chunkNumber = 1;
+
+        foreach (var table in tables)
+        {
+            if (table.Headers.Count == 0 || table.Rows.Count == 0)
+                continue;
+
+            var tableId = BuildExcelTableId(documentInfo, table);
+            var tableHeader = FormatExcelRow(table.Headers);
+            var sectionPrefix = string.IsNullOrWhiteSpace(table.TableContext)
+                ? string.Empty
+                : $"[Section: {table.TableContext}]";
+            var fixedWordCount =
+                table.Headers.Sum(CountWords) +
+                CountWords(sectionPrefix);
+            var rowWordCapacity = maxChunkWords - fixedWordCount;
+
+            if (rowWordCapacity <= 0)
+            {
+                throw new InvalidOperationException(
+                    $"The repeated header for Excel table '{table.SheetName}' " +
+                    $"uses {fixedWordCount} words, exceeding the {maxChunkWords}-word chunk limit.");
+            }
+
+            var parentText = string.Join(
+                Environment.NewLine,
+                table.TableContext,
+                tableHeader);
+
+            var chunkRows = new List<ExcelTableRow>();
+            var chunkWordCount = fixedWordCount;
+
+            void FlushChunk()
+            {
+                if (chunkRows.Count == 0)
+                    return;
+
+                var textBuilder = new StringBuilder();
+
+                if (!string.IsNullOrWhiteSpace(sectionPrefix))
+                    textBuilder.AppendLine(sectionPrefix);
+
+                textBuilder.AppendLine(tableHeader);
+                foreach (var row in chunkRows)
+                    textBuilder.AppendLine(FormatExcelRow(row.Cells));
+
+                var rows = chunkRows.ToList();
+                chunks.Add(new DocumentChunk
+                {
+                    DocumentId = documentInfo.DocumentId.ToString(),
+                    DocumentName = documentInfo.DocumentName,
+                    DocumentType = documentInfo.DocumentType,
+                    RelativePath = documentInfo.RelativePath,
+                    ChunkNumber = chunkNumber++,
+                    Text = textBuilder.ToString().Trim(),
+                    ParentText = parentText,
+                    TableId = tableId,
+                    ParentBlockId = tableId,
+                    TableContext = table.TableContext,
+                    SheetName = table.SheetName,
+                    RowStartIndex = rows[0].RowIndex,
+                    RowEndIndex = rows[^1].RowIndex,
+                    RowIdentifiers = rows
+                        .SelectMany(row => row.Identifiers)
+                        .Distinct(StringComparer.OrdinalIgnoreCase)
+                        .ToList(),
+                    StructuredRowsJson = JsonSerializer.Serialize(
+                        rows.Select(row => new
+                        {
+                            rowIndex = row.RowIndex,
+                            headerText = tableHeader,
+                            rowText = FormatExcelRow(row.Cells),
+                            fields = row.Fields
+                        }))
+                });
+
+                chunkRows.Clear();
+                chunkWordCount = fixedWordCount;
+            }
+
+            foreach (var sourceRow in table.Rows)
+            {
+                foreach (var row in SplitExcelRow(sourceRow, table.Headers.Count, rowWordCapacity))
+                {
+                    var rowWordCount = row.Cells.Sum(CountWords);
+
+                    if (chunkRows.Count > 0 &&
+                        chunkWordCount + rowWordCount > maxChunkWords)
+                    {
+                        FlushChunk();
+                    }
+
+                    chunkRows.Add(row);
+                    chunkWordCount += rowWordCount;
+                }
+            }
+
+            FlushChunk();
+        }
+
+        return chunks;
+    }
+
+    private static IReadOnlyList<ExcelTableRow> SplitExcelRow(
+        ExcelTableRow row,
+        int columnCount,
+        int maxRowWords)
+    {
+        if (row.Cells.Sum(CountWords) <= maxRowWords)
+            return [row];
+
+        if (row.Cells.Count == 0)
+        {
+            throw new InvalidOperationException(
+                $"Excel row {row.RowIndex} exceeds the chunk word limit and has no cell values for safe splitting.");
+        }
+
+        var cellWords = row.Cells
+            .Select(cell => Regex.Matches(cell, @"\S+")
+                .Cast<Match>()
+                .Select(match => match.Value)
+                .ToArray())
+            .ToArray();
+        var offsets = new int[cellWords.Length];
+        var fragments = new List<ExcelTableRow>();
+
+        while (offsets.Where((offset, index) => offset < cellWords[index].Length).Any())
+        {
+            var remainingWords = maxRowWords;
+            var fragmentCells = Enumerable
+                .Repeat(string.Empty, columnCount)
+                .ToArray();
+
+            for (var cellIndex = 0; cellIndex < columnCount; cellIndex++)
+            {
+                if (remainingWords == 0)
+                    break;
+
+                if (cellIndex < cellWords.Length &&
+                    offsets[cellIndex] < cellWords[cellIndex].Length)
+                {
+                    var takeCount = Math.Min(
+                        remainingWords,
+                        cellWords[cellIndex].Length - offsets[cellIndex]);
+                    fragmentCells[cellIndex] = string.Join(
+                        " ",
+                        cellWords[cellIndex].Skip(offsets[cellIndex]).Take(takeCount));
+                    offsets[cellIndex] += takeCount;
+                    remainingWords -= takeCount;
+                }
+                else
+                {
+                    fragmentCells[cellIndex] = string.Empty;
+                }
+            }
+
+            fragments.Add(new ExcelTableRow
+            {
+                RowIndex = row.RowIndex,
+                Cells = fragmentCells,
+                Text = FormatExcelRow(fragmentCells),
+                Fields = row.Fields,
+                Identifiers = row.Identifiers
+            });
+        }
+
+        return fragments;
+    }
+
+    private static string BuildExcelTableId(
+        DocumentInfo documentInfo,
+        ExcelTableBlock table)
+    {
+        var identity = string.Join(
+            "\n",
+            documentInfo.DocumentId,
+            table.SheetName,
+            table.TableIndex,
+            string.Join("|", table.Headers));
+        var hash = Convert.ToHexString(
+            SHA256.HashData(Encoding.UTF8.GetBytes(identity)))[..12];
+
+        return $"{documentInfo.DocumentId}:excel-table:{hash}";
+    }
+
+    private static string FormatMarkdownRow(IReadOnlyList<string> cells)
+    {
+        return "| " +
+               string.Join(
+                   " | ",
+                   cells.Select(value => value.Replace("|", "\\|", StringComparison.Ordinal))) +
+               " |";
+    }
+
+    private static string FormatExcelRow(IReadOnlyList<string> cells)
+    {
+        return string.Join(
+            '\t',
+            cells.Select(value => value.Replace('\t', ' ')));
+    }
+
+    private static string FormatMarkdownSeparator(int columnCount)
+    {
+        return "| " + string.Join(" | ", Enumerable.Repeat("---", columnCount)) + " |";
+    }
+
     private static void AddTableChildChunks(
         List<DocumentChunk> chunks,
         DocumentInfo documentInfo,
@@ -229,7 +445,9 @@ public class ChunkingService : IChunkingService
 
     private static int CountWords(string text)
     {
-        return Regex.Matches(text, @"\S+").Count;
+        return string.IsNullOrWhiteSpace(text)
+            ? 0
+            : text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Length;
     }
 
     private static void AddWordChunks(

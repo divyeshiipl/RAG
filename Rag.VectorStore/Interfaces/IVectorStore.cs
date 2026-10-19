@@ -22,7 +22,11 @@ public interface IVectorStore
         string tableContext = "",
         int? pageNumber = null,
         string? sheetName = null,
-        string? sqlObjectType = null);
+        string? sqlObjectType = null,
+        int? rowStartIndex = null,
+        int? rowEndIndex = null,
+        IReadOnlyList<string>? rowIdentifiers = null,
+        string structuredRowsJson = "");
 
     Task<IReadOnlyList<VectorSearchResult>> SearchAsync(
         float[] queryVector,
@@ -30,4 +34,9 @@ public interface IVectorStore
         int limit = 5);
 
     Task<IReadOnlyList<VectorSearchResult>> GetDocumentChunksAsync(string documentId);
+
+    Task<IReadOnlyList<VectorSearchResult>> SearchByRowIdentifierAsync(
+        string rowIdentifier,
+        string? documentId = null,
+        string? sheetName = null);
 }

@@ -39,7 +39,7 @@ public partial class MainWindow : Window
         AnswerBox.Document.Blocks.Clear();
         AnswerBox.Document.Blocks.Add(new Paragraph());
 
-        StatusText.Text = "Retrieving context and generating answer…";
+        StatusText.Text = "Retrieving evidence and generating answer…";
 
         _cts = new CancellationTokenSource();
 
@@ -47,9 +47,9 @@ public partial class MainWindow : Window
         {
             var result = await _pipeline.AskAsync(
                 question,
-                onToken: token =>
+                onAnswer: answer =>
                 {
-                    Dispatcher.Invoke(() => AppendToken(token));
+                    Dispatcher.Invoke(() => AppendToken(answer));
                 },
                 cancellationToken: _cts.Token);
 

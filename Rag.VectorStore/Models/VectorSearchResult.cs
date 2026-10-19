@@ -1,4 +1,4 @@
-﻿namespace Rag.VectorStore.Models;
+namespace Rag.VectorStore.Models;
 
 public class VectorSearchResult
 {
@@ -24,5 +24,10 @@ public class VectorSearchResult
     public int? PageNumber { get; set; }
     public string? SheetName { get; set; }
     public string? SqlObjectType { get; set; }
+    public int? RowStartIndex { get; set; }
+    public int? RowEndIndex { get; set; }
+    public IReadOnlyList<string> RowIdentifiers { get; set; } = [];
+    public string StructuredRowsJson { get; set; } = string.Empty;
+    public bool IsStructuredMatch { get; set; }
 
 }

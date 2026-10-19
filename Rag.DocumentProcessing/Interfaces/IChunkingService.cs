@@ -16,5 +16,9 @@ public interface IChunkingService
        int childChunkSize = DocumentConstants.ChildChunkSize,
        int overlap = DocumentConstants.Overlap);
 
+    IReadOnlyList<DocumentChunk> CreateExcelTableChunks(
+        DocumentInfo documentInfo,
+        IReadOnlyList<ExcelTableBlock> tables,
+        int maxChunkWords = DocumentConstants.ChildChunkSize);
 
 }

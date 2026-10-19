@@ -1,11 +1,12 @@
-﻿using ClosedXML.Excel;
+using ClosedXML.Excel;
 using Rag.DocumentProcessing.Constants;
 using Rag.DocumentProcessing.Interfaces;
+using Rag.DocumentProcessing.Models;
 using System.Text;
 
 namespace Rag.DocumentProcessing.Parsers;
 
-public class ExcelDocumentParser : IDocumentParser
+public class ExcelDocumentParser : IDocumentParser, IExcelTableParser
 {
     public Task<string> ParseAsync(
         string filePath,
@@ -46,44 +47,202 @@ public class ExcelDocumentParser : IDocumentParser
             NormalizeDocumentText(builder.ToString()));
     }
 
-    public Task<List<string>> ParseAndChunkAsync(
+    public async Task<List<string>> ParseAndChunkAsync(
         string filePath,
         int chunkSize = DocumentConstants.ChunkSize,
         int childChunkSize = DocumentConstants.ChildChunkSize,
         int overlap = DocumentConstants.Overlap,
         CancellationToken cancellationToken = default)
     {
-        using var workbook = new XLWorkbook(filePath);
+        var tables = await ParseTablesAsync(filePath, cancellationToken);
+        return tables.Select(table =>
+        {
+            var lines = new List<string>();
+            lines.Add(FormatMarkdownRow(table.Headers));
+            lines.Add(FormatMarkdownSeparator(table.Headers.Count));
+            lines.AddRange(table.Rows.Select(row => row.Text));
+            return string.Join(Environment.NewLine, lines);
+        }).ToList();
+    }
 
-        var parentChunks = new List<string>();
+    public Task<IReadOnlyList<ExcelTableBlock>> ParseTablesAsync(
+        string filePath,
+        CancellationToken cancellationToken = default)
+    {
+        using var workbook = new XLWorkbook(filePath);
+        var tables = new List<ExcelTableBlock>();
 
         foreach (var worksheet in workbook.Worksheets)
         {
             cancellationToken.ThrowIfCancellationRequested();
-
             var range = worksheet.RangeUsed();
-
-            if (range == null)
+            if (range is null)
                 continue;
 
-            var sheetText = ConvertSheetToMarkdown(
-                worksheet,
-                range,
-                cancellationToken);
+            var currentRows = new List<ExcelSourceRow>();
+            var tableContext = string.Empty;
+            var tableIndex = 0;
 
-            if (string.IsNullOrWhiteSpace(sheetText))
-                continue;
+            void FlushTable()
+            {
+                if (currentRows.Count >= 2)
+                {
+                    var header = currentRows[0];
+                    var dataRows = currentRows.Skip(1).ToList();
+                    var rowKeyColumns = GetUniqueValueColumns(header.Cells.Count, dataRows);
 
-            var chunks = BuildChunksWithHeader(
-                worksheet.Name,
-                sheetText,
-                chunkSize);
+                    if (header.Cells.Count > 0 && dataRows.Count > 0)
+                    {
+                        tables.Add(new ExcelTableBlock
+                        {
+                            SheetName = worksheet.Name,
+                            TableContext = tableContext,
+                            TableIndex = ++tableIndex,
+                            Headers = header.Cells,
+                            Rows = dataRows.Select(row => new ExcelTableRow
+                            {
+                                RowIndex = row.RowIndex,
+                                Text = FormatMarkdownRow(row.Cells, header.Cells.Count),
+                                Cells = row.Cells,
+                                Fields = CreateStructuredFields(header.Cells, row.Cells),
+                                Identifiers = rowKeyColumns
+                                    .Where(index => index < row.Cells.Count)
+                                    .Select(index => row.Cells[index])
+                                    .Where(value => !string.IsNullOrWhiteSpace(value))
+                                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                                    .ToList()
+                            }).ToList()
+                        });
+                    }
+                }
 
-            parentChunks.AddRange(chunks);
+                currentRows.Clear();
+            }
+
+            foreach (var row in range.Rows())
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var cells = row.Cells()
+                    .Select(GetCellText)
+                    .ToList();
+
+                while (cells.Count > 0 && string.IsNullOrWhiteSpace(cells[^1]))
+                    cells.RemoveAt(cells.Count - 1);
+
+                if (cells.All(string.IsNullOrWhiteSpace))
+                {
+                    FlushTable();
+                    tableContext = string.Empty;
+                    continue;
+                }
+
+                var populatedCells = cells.Count(value => !string.IsNullOrWhiteSpace(value));
+                if (populatedCells == 1 && currentRows.Count > 0)
+                {
+                    FlushTable();
+                    tableContext = cells.First(value => !string.IsNullOrWhiteSpace(value));
+                    continue;
+                }
+
+                if (currentRows.Count >= 2 &&
+                    RowsMatch(currentRows[0].Cells, cells))
+                {
+                    FlushTable();
+                }
+
+                if (currentRows.Count == 0 && populatedCells == 1)
+                {
+                    tableContext = cells.First(value => !string.IsNullOrWhiteSpace(value));
+                    continue;
+                }
+
+                currentRows.Add(new ExcelSourceRow(row.RowNumber(), cells));
+            }
+
+            FlushTable();
         }
 
-        return Task.FromResult(parentChunks);
+        return Task.FromResult<IReadOnlyList<ExcelTableBlock>>(tables);
     }
+
+    private static List<int> GetUniqueValueColumns(
+        int columnCount,
+        IReadOnlyList<ExcelSourceRow> rows)
+    {
+        return Enumerable.Range(0, columnCount)
+            .Where(columnIndex =>
+            {
+                var values = rows
+                    .Select(row => columnIndex < row.Cells.Count
+                        ? row.Cells[columnIndex].Trim()
+                        : string.Empty)
+                    .ToList();
+                var nonEmptyValues = values
+                    .Where(value => value.Length > 0)
+                    .ToList();
+
+                return nonEmptyValues.Count == rows.Count &&
+                       nonEmptyValues.Distinct(StringComparer.OrdinalIgnoreCase).Count() == rows.Count;
+            })
+            .ToList();
+    }
+
+    private static IReadOnlyDictionary<string, string> CreateStructuredFields(
+        IReadOnlyList<string> headers,
+        IReadOnlyList<string> cells)
+    {
+        var fields = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        for (var index = 0; index < headers.Count; index++)
+        {
+            var header = string.IsNullOrWhiteSpace(headers[index])
+                ? $"Column {index + 1}"
+                : headers[index].Trim();
+
+            var uniqueHeader = header;
+            var duplicateIndex = 2;
+            while (fields.ContainsKey(uniqueHeader))
+                uniqueHeader = $"{header} ({duplicateIndex++})";
+
+            fields[uniqueHeader] = index < cells.Count ? cells[index] : string.Empty;
+        }
+
+        return fields;
+    }
+
+    private static bool RowsMatch(
+        IReadOnlyList<string> first,
+        IReadOnlyList<string> candidate)
+    {
+        return first.Count == candidate.Count &&
+               first.SequenceEqual(candidate, StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static string FormatMarkdownRow(
+        IReadOnlyList<string> cells,
+        int columnCount)
+    {
+        return "| " +
+               string.Join(
+                   " | ",
+                   Enumerable.Range(0, columnCount)
+                       .Select(index => index < cells.Count ? cells[index] : string.Empty)
+                       .Select(value => value.Replace("|", "\\|", StringComparison.Ordinal))) +
+               " |";
+    }
+
+    private static string FormatMarkdownRow(IReadOnlyList<string> cells)
+    {
+        return FormatMarkdownRow(cells, cells.Count);
+    }
+
+    private static string FormatMarkdownSeparator(int columnCount)
+    {
+        return "| " + string.Join(" | ", Enumerable.Repeat("---", columnCount)) + " |";
+    }
+
+    private sealed record ExcelSourceRow(int RowIndex, List<string> Cells);
 
     private static string ConvertSheetToMarkdown(
         IXLWorksheet worksheet,
@@ -140,64 +299,6 @@ public class ExcelDocumentParser : IDocumentParser
         }
 
         return builder.ToString().Trim();
-    }
-
-    private static List<string> BuildChunksWithHeader(
-     string sheetName,
-     string sheetText,
-     int chunkSize,
-     double overlapPercent = 0.20)
-    {
-        var chunks = new List<string>();
-        var lines = sheetText
-            .Split('\n', StringSplitOptions.RemoveEmptyEntries)
-            .Select(l => l.TrimEnd())
-            .Where(l => !string.IsNullOrWhiteSpace(l))
-            .ToList();
-
-        if (lines.Count == 0)
-            return chunks;
-
-        var headerLine = lines[0];
-        var headerPrefix = $"Sheet: {sheetName}{Environment.NewLine}{headerLine}{Environment.NewLine}";
-        var overlapSize = (int)(chunkSize * overlapPercent);
-
-        var current = new List<string>();
-        var currentLength = 0;
-
-        for (var i = 1; i < lines.Count; i++)
-        {
-            var line = lines[i];
-
-            if (currentLength + line.Length > chunkSize && current.Count > 0)
-            {
-                chunks.Add(headerPrefix + string.Join(Environment.NewLine, current));
-
-                // Overlap: last kuch lines rakho
-                var overlapLines = new List<string>();
-                var overlapLength = 0;
-
-                for (int j = current.Count - 1; j >= 0; j--)
-                {
-                    if (overlapLength + current[j].Length > overlapSize)
-                        break;
-
-                    overlapLines.Insert(0, current[j]);
-                    overlapLength += current[j].Length;
-                }
-
-                current = overlapLines;
-                currentLength = overlapLength;
-            }
-
-            current.Add(line);
-            currentLength += line.Length;
-        }
-
-        if (current.Count > 0)
-            chunks.Add(headerPrefix + string.Join(Environment.NewLine, current));
-
-        return chunks;
     }
 
     private static string GetCellText(IXLCell cell)

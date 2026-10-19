@@ -34,7 +34,7 @@ public partial class App : Application
 
         // RAG services
         services.AddHttpClient<IEmbeddingGenerator, OllamaEmbeddingGenerator>();
-        services.AddHttpClient();
+        services.AddHttpClient<ITextGenerator, OllamaTextGenerator>();
         services.AddSingleton<IVectorStore>(_ => new QdrantVectorStore("localhost"));
 
         // Logger 

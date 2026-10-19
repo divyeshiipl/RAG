@@ -1,9 +1,11 @@
-﻿using Qdrant.Client;
+using Qdrant.Client;
 using Qdrant.Client.Grpc;
 using Rag.VectorStore.Interfaces;
 using Rag.VectorStore.Models;
+using System.Text.Json;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Globalization;
 
 using QdrantMatch = Qdrant.Client.Grpc.Match;
 using RegexMatch = System.Text.RegularExpressions.Match;
@@ -14,6 +16,8 @@ public class QdrantVectorStore : IVectorStore
 {
     private readonly QdrantClient _client;
     private readonly Lazy<Task<IReadOnlyList<RetrievedPoint>>> _payloadCache;
+    private readonly Lazy<Task<IReadOnlyList<StructuredPayloadRows>>> _structuredRowsCache;
+    private readonly Lazy<Task<Bm25Index>> _bm25Index;
 
     private const string CollectionName = "document_chunks_2";
     private const ulong VectorSize = 384;
@@ -28,6 +32,12 @@ public class QdrantVectorStore : IVectorStore
 
         _payloadCache = new Lazy<Task<IReadOnlyList<RetrievedPoint>>>(
             LoadAllPayloadsAsync,
+            LazyThreadSafetyMode.ExecutionAndPublication);
+        _structuredRowsCache = new Lazy<Task<IReadOnlyList<StructuredPayloadRows>>>(
+            LoadStructuredRowsAsync,
+            LazyThreadSafetyMode.ExecutionAndPublication);
+        _bm25Index = new Lazy<Task<Bm25Index>>(
+            LoadBm25IndexAsync,
             LazyThreadSafetyMode.ExecutionAndPublication);
     }
 
@@ -81,6 +91,11 @@ public class QdrantVectorStore : IVectorStore
         await _client.CreatePayloadIndexAsync(collectionName: CollectionName, fieldName: "parentBlockId", schemaType: PayloadSchemaType.Keyword);
 
         await _client.CreatePayloadIndexAsync(collectionName: CollectionName, fieldName: "documentId", schemaType: PayloadSchemaType.Keyword);
+
+        await _client.CreatePayloadIndexAsync(collectionName: CollectionName, fieldName: "sheetName", schemaType: PayloadSchemaType.Keyword);
+        await _client.CreatePayloadIndexAsync(collectionName: CollectionName, fieldName: "rowIdentifiers", schemaType: PayloadSchemaType.Keyword);
+        await _client.CreatePayloadIndexAsync(collectionName: CollectionName, fieldName: "rowStartIndex", schemaType: PayloadSchemaType.Integer);
+        await _client.CreatePayloadIndexAsync(collectionName: CollectionName, fieldName: "rowEndIndex", schemaType: PayloadSchemaType.Integer);
     }
 
     public async Task UpsertAsync(
@@ -99,7 +114,11 @@ public class QdrantVectorStore : IVectorStore
         string tableContext = "",
         int? pageNumber = null,
         string? sheetName = null,
-        string? sqlObjectType = null)
+        string? sqlObjectType = null,
+        int? rowStartIndex = null,
+        int? rowEndIndex = null,
+        IReadOnlyList<string>? rowIdentifiers = null,
+        string structuredRowsJson = "")
     {
         var point = new PointStruct
         {
@@ -119,7 +138,9 @@ public class QdrantVectorStore : IVectorStore
                 ["fileType"] = fileType,
                 ["relativePath"] = relativePath,
                 ["searchText"] = NormalizeVersionAliases(
-                    $"{documentName} {relativePath} {tableContext} {text} {parentText}")
+                    $"{documentName} {relativePath} {sheetName} {tableContext} " +
+                    $"{string.Join(" ", rowIdentifiers ?? Array.Empty<string>())} {text} {parentText}"),
+                ["structuredRowsJson"] = structuredRowsJson
             }
         };
 
@@ -131,6 +152,22 @@ public class QdrantVectorStore : IVectorStore
 
         if (!string.IsNullOrWhiteSpace(sqlObjectType))
             point.Payload["sqlObjectType"] = sqlObjectType;
+        if (rowStartIndex.HasValue)
+            point.Payload["rowStartIndex"] = rowStartIndex.Value;
+        if (rowEndIndex.HasValue)
+            point.Payload["rowEndIndex"] = rowEndIndex.Value;
+        if (rowIdentifiers is { Count: > 0 })
+        {
+            var normalizedRowIdentifiers = rowIdentifiers
+                .Where(identifier => !string.IsNullOrWhiteSpace(identifier))
+                .Select(NormalizeIdentifierValue)
+                .Where(identifier => !string.IsNullOrWhiteSpace(identifier))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+
+            if (normalizedRowIdentifiers.Length > 0)
+                point.Payload["rowIdentifiers"] = normalizedRowIdentifiers;
+        }
 
         await _client.UpsertAsync(CollectionName, new[] { point });
     }
@@ -140,6 +177,8 @@ public class QdrantVectorStore : IVectorStore
         string queryText,
         int limit = 5)
     {
+        var normalizedQuery = NormalizeVersionAliases(queryText);
+
         var candidateLimit = Math.Clamp(
             limit * CandidateMultiplier,
             MinCandidates,
@@ -152,83 +191,37 @@ public class QdrantVectorStore : IVectorStore
             query: queryVector,
             limit: (ulong)candidateLimit);
 
-        var normalizedQuery = NormalizeVersionAliases(queryText);
-        var cleanedQuery = CleanQueryForFullText(normalizedQuery);
-
-        var textResults = new List<RetrievedPoint>();
-
-        if (!string.IsNullOrWhiteSpace(cleanedQuery))
-        {
-            var textResponse = await _client.ScrollAsync(
-                collectionName: CollectionName,
-                filter: new Filter
-                {
-                    Must =
-                    {
-                        new Condition
-                        {
-                            Field = new FieldCondition
-                            {
-                                Key = "searchText",
-                                Match = new QdrantMatch
-                                {
-                                    Text = cleanedQuery
-                                }
-                            }
-                        }
-                    }
-                },
-                limit: (uint)candidateLimit);
-
-            textResults = textResponse.Result?.ToList()
-                ?? new List<RetrievedPoint>();
-        }
-
-        var lexicalTask = SearchLexicalCandidatesAsync(normalizedQuery);
+        var lexicalTask = SearchLexicalCandidatesAsync(
+            normalizedQuery,
+            candidateLimit);
 
         await Task.WhenAll(semanticTask, lexicalTask);
 
         var semanticResults = await semanticTask;
         var lexicalResults = await lexicalTask;
 
-        var combined = new Dictionary<ulong, double>();
-
-        for (var i = 0; i < semanticResults.Count; i++)
-        {
-            var id = semanticResults[i].Id.Num;
-            combined[id] = combined.GetValueOrDefault(id) + 1.0 / (i + 60);
-        }
-
-        for (var i = 0; i < textResults.Count; i++)
-        {
-            var id = textResults[i].Id.Num;
-            combined[id] = combined.GetValueOrDefault(id) + 1.0 / (i + 60);
-        }
-
-        foreach (var result in lexicalResults)
-        {
-            combined[result.Id.Num] =
-                combined.GetValueOrDefault(result.Id.Num) + 1.0;
-        }
-
         var candidateResults = semanticResults
             .Select(MapToResult)
-            .Concat(textResults.Select(MapRetrievedToResult))
             .Concat(lexicalResults.Select(MapRetrievedToResult))
             .GroupBy(x => x.Id)
             .Select(group => group.First())
             .ToList();
 
-        var lexicalScores = candidateResults
-            .ToDictionary(
-                result => result.Id,
-                result => CalculateLexicalBoost(result, normalizedQuery));
+        const int reciprocalRankConstant = 60;
+        var fusedScores = new Dictionary<ulong, double>();
 
-        foreach (var candidate in candidateResults)
+        for (var rank = 0; rank < semanticResults.Count; rank++)
         {
-            combined[candidate.Id] =
-                combined.GetValueOrDefault(candidate.Id) +
-                lexicalScores.GetValueOrDefault(candidate.Id);
+            var id = semanticResults[rank].Id.Num;
+            fusedScores[id] = fusedScores.GetValueOrDefault(id) +
+                1d / (reciprocalRankConstant + rank + 1);
+        }
+
+        for (var rank = 0; rank < lexicalResults.Count; rank++)
+        {
+            var id = lexicalResults[rank].Id.Num;
+            fusedScores[id] = fusedScores.GetValueOrDefault(id) +
+                1d / (reciprocalRankConstant + rank + 1);
         }
 
         var queryIdentifiers = ExtractQueryIdentifiers(queryText);
@@ -242,45 +235,49 @@ public class QdrantVectorStore : IVectorStore
 
         foreach (var candidate in candidateResults)
         {
-            var baseScore = combined.GetValueOrDefault(candidate.Id);
             candidate.Score = (float)(
-                baseScore
-                + lexicalScores.GetValueOrDefault(candidate.Id) * 10
-                + (identifierMatches.Contains(candidate.Id) ? 10000 : 0));
+                fusedScores.GetValueOrDefault(candidate.Id) * 1000 +
+                (identifierMatches.Contains(candidate.Id) ? 100 : 0));
         }
 
         var selected = SelectMinimumChunks(queryText, candidateResults);
 
-        var selectedTableIds = selected
-            .Where(r => !string.IsNullOrWhiteSpace(r.TableId))
-            .Select(r => r.TableId)
-            .Distinct()
-            .ToList();
-
-        if (selectedTableIds.Count > 0)
-        {
-            var tableTasks = selectedTableIds
-                .Select(id => FetchTableChunksAsync(id, baseScore: 5000))
-                .ToList();
-
-            var tableChunks = (await Task.WhenAll(tableTasks))
-                .SelectMany(r => r)
-                .ToList();
-
-            selected = selected
-                .Concat(tableChunks)
-                .GroupBy(r => r.Id)
-                .Select(g => g.First())
-                .ToList();
-        }
-
-        return selected
+        var rankedResults = selected
             .OrderByDescending(r => r.Score)
             .GroupBy(r => r.Id)
             .Select(g => g.First())
+            .ToList();
+
+        var seenContent = new HashSet<string>(StringComparer.Ordinal);
+        var textResults = rankedResults
+            .Where(result =>
+            {
+                var content = !string.IsNullOrWhiteSpace(result.TableId)
+                    ? result.Text
+                    : string.IsNullOrWhiteSpace(result.ParentText)
+                        ? result.Text
+                        : result.ParentText;
+                var normalizedContent = NormalizeForSearch(content);
+                return string.IsNullOrWhiteSpace(normalizedContent) ||
+                       seenContent.Add(normalizedContent);
+            })
             .OrderBy(r => r.DocumentId)
             .ThenBy(r => r.ChunkNumber)
             .ToList();
+
+        var relevantDocumentIds = textResults
+            .Select(result => result.DocumentId)
+            .Where(documentId => !string.IsNullOrWhiteSpace(documentId))
+            .ToHashSet(StringComparer.Ordinal);
+        if (relevantDocumentIds.Count == 0)
+            return textResults;
+
+        var structuredSearch = await SearchStructuredRowsAsync(
+            normalizedQuery,
+            relevantDocumentIds);
+        return structuredSearch.IsApplicable && structuredSearch.Results.Count > 0
+            ? structuredSearch.Results
+            : textResults;
     }
 
     public async Task<IReadOnlyList<VectorSearchResult>> GetDocumentChunksAsync(
@@ -311,6 +308,79 @@ public class QdrantVectorStore : IVectorStore
             .ToList();
     }
 
+    public async Task<IReadOnlyList<VectorSearchResult>> SearchByRowIdentifierAsync(
+        string rowIdentifier,
+        string? documentId = null,
+        string? sheetName = null)
+    {
+        if (string.IsNullOrWhiteSpace(rowIdentifier))
+            throw new ArgumentException("A row identifier is required.", nameof(rowIdentifier));
+
+        var normalizedIdentifier = NormalizeIdentifierValue(rowIdentifier);
+        var filter = new Filter();
+        filter.Must.Add(new Condition
+        {
+            Field = new FieldCondition
+            {
+                Key = "rowIdentifiers",
+                Match = new QdrantMatch { Keyword = normalizedIdentifier }
+            }
+        });
+
+        if (!string.IsNullOrWhiteSpace(documentId))
+        {
+            filter.Must.Add(new Condition
+            {
+                Field = new FieldCondition
+                {
+                    Key = "documentId",
+                    Match = new QdrantMatch { Keyword = documentId }
+                }
+            });
+        }
+
+        if (!string.IsNullOrWhiteSpace(sheetName))
+        {
+            filter.Must.Add(new Condition
+            {
+                Field = new FieldCondition
+                {
+                    Key = "sheetName",
+                    Match = new QdrantMatch { Keyword = sheetName }
+                }
+            });
+        }
+
+        var response = await _client.ScrollAsync(
+            collectionName: CollectionName,
+            filter: filter,
+            limit: 1000);
+
+        var matches = (response.Result ?? [])
+            .Select(MapRetrievedToResult)
+            .ToList();
+
+        if (matches.Count > 0)
+            return matches
+                .OrderBy(result => result.DocumentId)
+                .ThenBy(result => result.SheetName)
+                .ThenBy(result => result.RowStartIndex)
+                .ToList();
+
+        var fallback = await _client.ScrollAsync(
+            collectionName: CollectionName,
+            limit: 1000);
+
+        return (fallback.Result ?? [])
+            .Select(MapRetrievedToResult)
+            .Where(result => result.RowIdentifiers.Any(identifier =>
+                string.Equals(NormalizeIdentifierValue(identifier), normalizedIdentifier, StringComparison.OrdinalIgnoreCase)))
+            .OrderBy(result => result.DocumentId)
+            .ThenBy(result => result.SheetName)
+            .ThenBy(result => result.RowStartIndex)
+            .ToList();
+    }
+
     // =================================================================
     // DYNAMIC MINIMUM CHUNK SELECTION
     // =================================================================
@@ -323,22 +393,44 @@ public class QdrantVectorStore : IVectorStore
             return new List<VectorSearchResult>();
 
         var intent = DetectQueryIntent(queryText);
+        var queryIdentifiers = ExtractQueryIdentifiers(queryText);
+        var rerankedCandidates = candidates
+            .Select(candidate => new
+            {
+                Candidate = candidate,
+                Score = GetConfidenceScore(candidate, queryIdentifiers)
+            })
+            .ToList();
+        var topScore = rerankedCandidates.Max(candidate => candidate.Score);
+        var scores = rerankedCandidates
+            .Select(candidate => candidate.Score)
+            .ToList();
+        var mean = scores.Average();
+        var stdDev = Math.Sqrt(scores
+            .Select(score => Math.Pow(score - mean, 2))
+            .Average());
+        var chunkCutoff = Math.Min(
+            topScore,
+            Math.Max(topScore * 0.65, mean + stdDev * 0.25));
+        var confidentCandidates = rerankedCandidates
+            .Where(candidate => candidate.Score >= chunkCutoff)
+            .Select(candidate => candidate.Candidate)
+            .ToList();
 
-        // WholeSection — retain all retrieved chunks (no score cutoff).
         if (intent == QueryIntent.WholeSection)
         {
-            return candidates
+            return confidentCandidates
                 .GroupBy(c => c.Id)
                 .Select(g => g.First())
                 .ToList();
         }
 
-        var groups = candidates
+        var groups = confidentCandidates
             .GroupBy(GetLogicalBlockKey)
             .Select(g => new
             {
                 Key = g.Key,
-                TopScore = g.Max(x => x.Score),
+                TopScore = g.Max(x => GetConfidenceScore(x, queryIdentifiers)),
                 Chunks = g.OrderBy(x => x.ChunkNumber).ToList()
             })
             .OrderByDescending(g => g.TopScore)
@@ -347,11 +439,11 @@ public class QdrantVectorStore : IVectorStore
         if (groups.Count == 0)
             return new List<VectorSearchResult>();
 
-        var topScore = groups[0].TopScore;
-        var scores = groups.Select(g => (double)g.TopScore).ToList();
-        var mean = scores.Average();
-        var stdDev = Math.Sqrt(scores
-            .Select(s => Math.Pow(s - mean, 2))
+        var topGroupScore = groups[0].TopScore;
+        var groupScores = groups.Select(g => (double)g.TopScore).ToList();
+        var groupMean = groupScores.Average();
+        var groupStdDev = Math.Sqrt(groupScores
+            .Select(s => Math.Pow(s - groupMean, 2))
             .Average());
 
         if (intent == QueryIntent.SingleFact)
@@ -362,7 +454,7 @@ public class QdrantVectorStore : IVectorStore
             if (best.Chunks.Count > 0)
             {
                 var bestMaxChunk = best.Chunks.Max(c => c.ChunkNumber);
-                var continuation = candidates
+                var continuation = confidentCandidates
                     .Where(c => c.ChunkNumber == bestMaxChunk + 1 &&
                                 selected.All(s => s.Id != c.Id))
                     .ToList();
@@ -376,7 +468,9 @@ public class QdrantVectorStore : IVectorStore
         const double ratio = 0.55;
         const int maxUnits = 12;
 
-        var cutoff = Math.Max(topScore * ratio, mean + stdDev * 0.25);
+        var cutoff = Math.Max(
+            topGroupScore * ratio,
+            groupMean + groupStdDev * 0.25);
 
         var picked = groups
             .Where(g => g.TopScore >= cutoff)
@@ -388,6 +482,7 @@ public class QdrantVectorStore : IVectorStore
 
         var result = picked
             .SelectMany(g => g.Chunks)
+            .Where(chunk => GetConfidenceScore(chunk, queryIdentifiers) >= chunkCutoff)
             .GroupBy(c => c.Id)
             .Select(g => g.First())
             .OrderByDescending(c => c.Score)
@@ -397,6 +492,20 @@ public class QdrantVectorStore : IVectorStore
             .GroupBy(c => c.Id)
             .Select(g => g.First())
             .ToList();
+    }
+
+    private static double GetConfidenceScore(
+        VectorSearchResult candidate,
+        IReadOnlyList<string> queryIdentifiers)
+    {
+        var score = candidate.Score;
+        if (queryIdentifiers.Count > 0 &&
+            ContainsAllIdentifierTokens(candidate, queryIdentifiers))
+        {
+            score -= 100;
+        }
+
+        return Math.Max(0, score);
     }
 
     private enum QueryIntent
@@ -446,53 +555,999 @@ public class QdrantVectorStore : IVectorStore
         return $"chunk:{result.DocumentId}:{result.ChunkNumber}";
     }
 
-    private async Task<List<VectorSearchResult>> FetchTableChunksAsync(
-        string tableId,
-        float baseScore)
+    private async Task<IReadOnlyList<RetrievedPoint>> LoadAllPayloadsAsync()
     {
-        var response = await _client.ScrollAsync(
-            collectionName: CollectionName,
-            filter: new Filter
-            {
-                Must =
-                {
-                    new Condition
-                    {
-                        Field = new FieldCondition
-                        {
-                            Key = "tableId",
-                            Match = new QdrantMatch
-                            {
-                                Keyword = tableId
-                            }
-                        }
-                    }
-                }
-            },
-            limit: 1000);
+        const uint pageSize = 1000;
+        var points = new List<RetrievedPoint>();
+        PointId? offset = null;
 
-        return (response.Result ?? [])
-            .Select(point =>
+        do
+        {
+            var response = await _client.ScrollAsync(
+                collectionName: CollectionName,
+                limit: pageSize,
+                offset: offset);
+
+            if (response.Result is { Count: > 0 })
+                points.AddRange(response.Result);
+
+            offset = response.NextPageOffset is { HasNum: true } or { HasUuid: true }
+                ? response.NextPageOffset
+                : null;
+        }
+        while (offset is not null);
+
+        return points;
+    }
+
+    private async Task<StructuredSearchResult> SearchStructuredRowsAsync(
+        string query,
+        IReadOnlySet<string> relevantDocumentIds)
+    {
+        var payloadRows = await _structuredRowsCache.Value;
+        if (payloadRows.Count == 0 || relevantDocumentIds.Count == 0)
+            return StructuredSearchResult.NotApplicable;
+        payloadRows = payloadRows
+            .Where(payload => relevantDocumentIds.Contains(
+                GetPayloadValue(payload.Point, "documentId")))
+            .ToList();
+        if (payloadRows.Count == 0)
+            return StructuredSearchResult.NotApplicable;
+
+        var rowsByTable = payloadRows
+            .SelectMany(payload => payload.Rows.EnumerateArray()
+                .Where(row => row.TryGetProperty("fields", out var fields) &&
+                              fields.ValueKind == JsonValueKind.Object)
+                .Select(row => new StructuredRowEntry(payload, row, false)))
+            .GroupBy(entry => GetStructuredTableKey(entry.Payload))
+            .ToDictionary(
+                group => group.Key,
+                group => (IReadOnlyList<StructuredRowEntry>)group.ToList(),
+                StringComparer.Ordinal);
+        var filtersByTable = ExtractObservedFilters(query, rowsByTable);
+        var requestedTableKeys = FindRequestedTableKeys(query, payloadRows);
+        var queryTerms = GetStructuredQueryTerms(query);
+        var headerMatchesByTable = rowsByTable.ToDictionary(
+            table => table.Key,
+            table =>
             {
-                var result = MapRetrievedToResult(point);
-                result.Score = baseScore - result.ChunkNumber;
-                return result;
+                var headers = table.Value.SelectMany(entry => entry.Row.GetProperty("fields")
+                    .EnumerateObject()
+                    .Select(field => field.Name))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+                var headerScore = CountMentionedHeaders(query, headers);
+                var tableTerms = new[]
+                    {
+                        GetPayloadValue(table.Value[0].Payload.Point, "sheetName"),
+                        GetPayloadValue(table.Value[0].Payload.Point, "tableContext")
+                    }
+                    .Where(label => !string.IsNullOrWhiteSpace(label))
+                    .SelectMany(GetStructuredQueryTerms)
+                    .Distinct(StringComparer.Ordinal)
+                    .Count(queryTerms.Contains);
+                return headerScore * 100 + tableTerms * 1000;
+            },
+            StringComparer.Ordinal);
+        var highestHeaderMatchCount = headerMatchesByTable.Values
+            .DefaultIfEmpty()
+            .Max();
+        if (filtersByTable.Count == 0 &&
+            requestedTableKeys.Count == 0 &&
+            highestHeaderMatchCount == 0)
+        {
+            return StructuredSearchResult.NotApplicable;
+        }
+
+        var targetTableKeys = requestedTableKeys.Count > 0
+            ? requestedTableKeys
+            : highestHeaderMatchCount > 0
+                ? headerMatchesByTable
+                    .Where(item => item.Value == highestHeaderMatchCount)
+                    .Select(item => item.Key)
+                    .ToHashSet(StringComparer.Ordinal)
+                : new HashSet<string>(StringComparer.Ordinal);
+        var matchingRows = new List<StructuredRowEntry>();
+
+        if (targetTableKeys.Count == 0)
+        {
+            var tableMatches = rowsByTable
+                .Where(group => filtersByTable.ContainsKey(group.Key))
+                .Select(group => new
+                {
+                    group.Key,
+                    Rows = group.Value
+                        .Where(entry => MatchesStructuredFilters(
+                            entry.Row,
+                            filtersByTable[group.Key]))
+                        .Select(entry => entry with { MatchesFilters = true })
+                        .ToList(),
+                    ExplicitHeaderMatches = headerMatchesByTable[group.Key]
+                })
+                .Where(group => group.Rows.Count > 0)
+                .ToList();
+
+            if (tableMatches.Count == 0)
+                return new StructuredSearchResult(true, Array.Empty<VectorSearchResult>());
+
+            var highestExplicitHeaderMatches = tableMatches
+                .Max(group => group.ExplicitHeaderMatches);
+            foreach (var tableMatch in tableMatches.Where(group =>
+                         highestExplicitHeaderMatches == 0 ||
+                         group.ExplicitHeaderMatches == highestExplicitHeaderMatches))
+            {
+                matchingRows.AddRange(tableMatch.Rows);
+            }
+        }
+        else
+        {
+            foreach (var targetKey in targetTableKeys)
+            {
+                if (!rowsByTable.TryGetValue(targetKey, out var targetRows))
+                    continue;
+
+                var targetFilters = filtersByTable.GetValueOrDefault(targetKey) ?? [];
+                var directMatches = targetRows
+                    .Where(entry => targetFilters.Count > 0 &&
+                                    MatchesStructuredFilters(entry.Row, targetFilters))
+                    .Select(entry => entry with { MatchesFilters = true })
+                    .ToList();
+
+                if (directMatches.Count > 0)
+                {
+                    matchingRows.AddRange(directMatches);
+                    continue;
+                }
+
+                var sourceRows = rowsByTable
+                    .Where(group => group.Key != targetKey &&
+                                    filtersByTable.ContainsKey(group.Key))
+                    .SelectMany(group =>
+                    {
+                        var filters = filtersByTable[group.Key];
+                        return group.Value
+                            .Where(entry => MatchesStructuredFilters(entry.Row, filters))
+                            .Select(entry => entry with { MatchesFilters = true });
+                    })
+                    .ToList();
+                var joinedRows = JoinStructuredRows(sourceRows, targetRows);
+                if (joinedRows.Count > 0)
+                {
+                    matchingRows.AddRange(joinedRows);
+                }
+                else if (targetFilters.Count == 0)
+                {
+                    matchingRows.AddRange(targetRows);
+                }
+            }
+        }
+
+        matchingRows = ApplyStructuredQueryOperation(query, matchingRows);
+
+        if (matchingRows.Count == 0)
+            return new StructuredSearchResult(true, Array.Empty<VectorSearchResult>());
+
+        var candidates = matchingRows
+            .GroupBy(entry => entry.Payload.Point.Id.Num)
+            .Select(group =>
+            {
+                var payload = group.First().Payload;
+                var rows = group
+                    .Select(entry => entry.Row)
+                    .Distinct(new JsonElementRowComparer())
+                    .OrderBy(row => row.TryGetProperty("rowIndex", out var index)
+                        ? index.GetInt32()
+                        : int.MaxValue)
+                    .ToList();
+                var mapped = MapRetrievedToResult(payload.Point);
+                mapped.Text = string.Join(
+                    Environment.NewLine,
+                    rows.SelectMany(GetStructuredRowTextParts)
+                        .Where(text => !string.IsNullOrWhiteSpace(text))
+                        .Distinct(StringComparer.Ordinal));
+                mapped.ParentText = string.Join(
+                    Environment.NewLine,
+                    rows.SelectMany(GetStructuredHeaderParts)
+                        .Distinct(StringComparer.Ordinal));
+                mapped.Score = 1;
+                mapped.RowStartIndex = rows
+                    .Where(row => row.TryGetProperty("rowIndex", out _))
+                    .Select(row => row.GetProperty("rowIndex").GetInt32())
+                    .DefaultIfEmpty(mapped.RowStartIndex ?? 0)
+                    .Min();
+                mapped.RowEndIndex = rows
+                    .Where(row => row.TryGetProperty("rowIndex", out _))
+                    .Select(row => row.GetProperty("rowIndex").GetInt32())
+                    .DefaultIfEmpty(mapped.RowEndIndex ?? 0)
+                    .Max();
+                mapped.StructuredRowsJson = $"[{string.Join(",", rows.Select(row => row.GetRawText()))}]";
+                mapped.IsStructuredMatch = true;
+                return mapped;
             })
-            .OrderBy(result => result.ChunkNumber)
+            .OrderBy(result => result.DocumentId)
+            .ThenBy(result => result.SheetName)
+            .ThenBy(result => result.RowStartIndex)
+            .ToList();
+
+        return new StructuredSearchResult(true, candidates);
+    }
+
+    private static int CountMentionedHeaders(
+        string query,
+        IReadOnlyList<string> headers)
+    {
+        var normalizedQuery = $" {NormalizeStructuredValue(query)} ";
+        var exactHeaderMatches = headers
+            .Select(NormalizeStructuredValue)
+            .Where(header => header.Length > 0 &&
+                             normalizedQuery.Contains($" {header} ", StringComparison.Ordinal))
+            .Distinct(StringComparer.Ordinal)
+            .Count();
+
+        var queryTerms = GetStructuredQueryTerms(query);
+        var aliasMatches = BuildHeaderAliases(headers)
+            .Where(alias => GetStructuredQueryTerms(alias.Alias)
+                .All(queryTerms.Contains))
+            .Select(alias => NormalizeStructuredValue(alias.Header))
+            .Distinct(StringComparer.Ordinal)
+            .Count();
+
+        return exactHeaderMatches * (headers.Count + 1) + aliasMatches;
+    }
+
+    private static HashSet<string> GetStructuredQueryTerms(string value)
+    {
+        return Regex.Matches(value, @"[\p{L}\p{N}]+")
+            .Select(match => NormalizeStructuredWord(match.Value))
+            .Where(word => word.Length > 0)
+            .ToHashSet(StringComparer.Ordinal);
+    }
+
+    private static string NormalizeStructuredWord(string word)
+    {
+        var normalized = word.ToLowerInvariant();
+        if (normalized.Length > 4 &&
+            normalized.EndsWith("ies", StringComparison.Ordinal))
+        {
+            return normalized[..^3] + "y";
+        }
+
+        if (normalized.Length > 4 &&
+            normalized.EndsWith("ed", StringComparison.Ordinal))
+        {
+            return normalized[..^2];
+        }
+
+        if (normalized.Length > 5 &&
+            normalized.EndsWith("ion", StringComparison.Ordinal))
+        {
+            return normalized[..^3];
+        }
+
+        if (normalized.Length > 3 &&
+            normalized.EndsWith('s') &&
+            !normalized.EndsWith("ss", StringComparison.Ordinal) &&
+            !normalized.EndsWith("us", StringComparison.Ordinal) &&
+            !normalized.EndsWith("is", StringComparison.Ordinal))
+        {
+            return normalized[..^1];
+        }
+
+        return normalized;
+    }
+
+    private static List<StructuredRowEntry> ApplyStructuredQueryOperation(
+        string query,
+        IReadOnlyList<StructuredRowEntry> sourceRows)
+    {
+        var rows = sourceRows
+            .DistinctBy(entry =>
+                $"{GetStructuredTableKey(entry.Payload)}|{entry.Row.GetRawText()}")
+            .ToList();
+        if (rows.Count == 0)
+            return rows;
+
+        var headers = rows
+            .SelectMany(entry => entry.Row.GetProperty("fields")
+                .EnumerateObject()
+                .Select(field => field.Name))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var mentionedHeaders = BuildHeaderAliases(headers)
+            .Where(alias => GetStructuredQueryTerms(alias.Alias)
+                .All(GetStructuredQueryTerms(query).Contains))
+            .Select(alias => NormalizeStructuredValue(alias.Header))
+            .ToHashSet(StringComparer.Ordinal);
+
+        if (Regex.IsMatch(
+                query,
+                @"\b(?:more\s+than\s+once|multiple\s+times|duplicat(?:e|es|ed|ion)|repeated)\b",
+                RegexOptions.IgnoreCase))
+        {
+            var duplicateValues = rows
+                .SelectMany(entry => entry.Row.GetProperty("fields").EnumerateObject()
+                    .Where(field => mentionedHeaders.Contains(
+                        NormalizeStructuredValue(field.Name)))
+                    .Select(field => NormalizeStructuredValue(
+                        GetStructuredScalarValue(field.Value))))
+                .Where(value => value.Length > 0)
+                .GroupBy(value => value, StringComparer.Ordinal)
+                .Where(group => group.Count() > 1)
+                .Select(group => group.Key)
+                .ToHashSet(StringComparer.Ordinal);
+
+            if (mentionedHeaders.Count > 0)
+            {
+                return rows
+                    .Where(entry => entry.Row.GetProperty("fields")
+                        .EnumerateObject()
+                        .Any(field =>
+                            mentionedHeaders.Contains(NormalizeStructuredValue(field.Name)) &&
+                            duplicateValues.Contains(NormalizeStructuredValue(
+                                GetStructuredScalarValue(field.Value)))))
+                    .ToList();
+            }
+        }
+
+        var numericHeaders = mentionedHeaders
+            .Where(header => rows.Any(entry => entry.Row.GetProperty("fields")
+                .EnumerateObject()
+                .Any(field =>
+                    NormalizeStructuredValue(field.Name) == header &&
+                    TryParseStructuredNumber(
+                        GetStructuredScalarValue(field.Value),
+                        out _))))
+            .ToList();
+
+        var comparison = GetStructuredComparison(query);
+        if (comparison is not null &&
+            TryGetQueryNumber(query, out var threshold) &&
+            numericHeaders.Count > 0)
+        {
+            return rows
+                .Where(entry => entry.Row.GetProperty("fields")
+                    .EnumerateObject()
+                    .Any(field =>
+                    {
+                        if (!numericHeaders.Contains(
+                                NormalizeStructuredValue(field.Name)) ||
+                            !TryParseStructuredNumber(
+                                GetStructuredScalarValue(field.Value),
+                                out var actual))
+                        {
+                            return false;
+                        }
+
+                        return comparison switch
+                        {
+                            StructuredComparison.GreaterThan => actual > threshold,
+                            StructuredComparison.GreaterThanOrEqual => actual >= threshold,
+                            StructuredComparison.LessThan => actual < threshold,
+                            StructuredComparison.LessThanOrEqual => actual <= threshold,
+                            StructuredComparison.Equal => actual == threshold,
+                            _ => false
+                        };
+                    }))
+                .ToList();
+        }
+
+        var extremum = GetStructuredExtremum(query);
+        if (extremum is not null && numericHeaders.Count > 0)
+        {
+            var values = rows
+                .SelectMany(entry => entry.Row.GetProperty("fields").EnumerateObject()
+                    .Where(field => numericHeaders.Contains(
+                        NormalizeStructuredValue(field.Name)))
+                    .Select(field => TryParseStructuredNumber(
+                        GetStructuredScalarValue(field.Value),
+                        out var value)
+                            ? (decimal?)value
+                            : null))
+                .Where(value => value.HasValue)
+                .Select(value => value!.Value)
+                .ToList();
+
+            if (values.Count > 0)
+            {
+                var target = extremum == StructuredExtremum.Maximum
+                    ? values.Max()
+                    : values.Min();
+                return rows
+                    .Where(entry => entry.Row.GetProperty("fields")
+                        .EnumerateObject()
+                        .Any(field =>
+                            numericHeaders.Contains(
+                                NormalizeStructuredValue(field.Name)) &&
+                            TryParseStructuredNumber(
+                                GetStructuredScalarValue(field.Value),
+                                out var value) &&
+                            value == target))
+                    .ToList();
+            }
+        }
+
+        var queriedYears = Regex.Matches(
+                query,
+                @"(?<![\p{L}\p{N}_-])(?:19|20)\d{2}(?![\p{L}\p{N}_-])")
+            .Select(match => match.Value)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        if (queriedYears.Count > 0 && mentionedHeaders.Count > 0)
+        {
+            var yearMatches = rows
+                .Where(entry => entry.Row.GetProperty("fields")
+                    .EnumerateObject()
+                    .Any(field =>
+                        mentionedHeaders.Contains(
+                            NormalizeStructuredValue(field.Name)) &&
+                        queriedYears.Any(year =>
+                            Regex.IsMatch(
+                                GetStructuredScalarValue(field.Value),
+                                $@"(?<!\d){Regex.Escape(year)}(?!\d)"))))
+                .ToList();
+            return yearMatches;
+        }
+
+        return rows;
+    }
+
+    private static bool TryParseStructuredNumber(string value, out decimal number)
+    {
+        var normalized = Regex.Replace(value, @"[^\d,.\-+]", string.Empty)
+            .Replace(",", string.Empty, StringComparison.Ordinal);
+        return decimal.TryParse(
+            normalized,
+            NumberStyles.Number,
+            CultureInfo.InvariantCulture,
+            out number);
+    }
+
+    private static bool TryGetQueryNumber(string query, out decimal number)
+    {
+        var matches = Regex.Matches(
+            query,
+            @"(?<![\p{L}\p{N}_-])[$€£]?\s*(?<number>\d[\d,]*(?:\.\d+)?)(?![\p{L}\p{N}_-])");
+        for (var index = matches.Count - 1; index >= 0; index--)
+        {
+            var candidate = matches[index].Groups["number"].Value;
+            if (decimal.TryParse(
+                    candidate.Replace(",", string.Empty, StringComparison.Ordinal),
+                    NumberStyles.Number,
+                    CultureInfo.InvariantCulture,
+                    out number))
+            {
+                return true;
+            }
+        }
+
+        number = 0;
+        return false;
+    }
+
+    private static StructuredComparison? GetStructuredComparison(string query)
+    {
+        if (Regex.IsMatch(query, @"\b(at\s+least|greater\s+than\s+or\s+equal|no\s+less\s+than)\b|>=", RegexOptions.IgnoreCase))
+            return StructuredComparison.GreaterThanOrEqual;
+        if (Regex.IsMatch(query, @"\b(at\s+most|less\s+than\s+or\s+equal|no\s+more\s+than)\b|<=", RegexOptions.IgnoreCase))
+            return StructuredComparison.LessThanOrEqual;
+        if (Regex.IsMatch(query, @"\b(more\s+than|greater\s+than|above|over|exceed(?:s|ing)?)\b|>", RegexOptions.IgnoreCase))
+            return StructuredComparison.GreaterThan;
+        if (Regex.IsMatch(query, @"\b(less\s+than|lower\s+than|below|under)\b|<", RegexOptions.IgnoreCase))
+            return StructuredComparison.LessThan;
+        if (Regex.IsMatch(query, @"\b(equal\s+to|exactly)\b|=", RegexOptions.IgnoreCase))
+            return StructuredComparison.Equal;
+
+        return null;
+    }
+
+    private static StructuredExtremum? GetStructuredExtremum(string query)
+    {
+        if (Regex.IsMatch(
+                query,
+                @"\b(highest|maximum|max(?:imum)?|greatest|largest|most\s+(?:expensive|costly))\b",
+                RegexOptions.IgnoreCase))
+        {
+            return StructuredExtremum.Maximum;
+        }
+
+        if (Regex.IsMatch(
+                query,
+                @"\b(lowest|minimum|min(?:imum)?|smallest|least\s+(?:expensive|costly)|cheapest)\b",
+                RegexOptions.IgnoreCase))
+        {
+            return StructuredExtremum.Minimum;
+        }
+
+        return null;
+    }
+
+    private static IReadOnlyDictionary<string, IReadOnlyList<StructuredFilter>> ExtractObservedFilters(
+        string query,
+        IReadOnlyDictionary<string, IReadOnlyList<StructuredRowEntry>> rowsByTable)
+    {
+        var normalizedQuery = $" {NormalizeStructuredValue(query)} ";
+        var filtersByTable = new Dictionary<string, IReadOnlyList<StructuredFilter>>(
+            StringComparer.Ordinal);
+        var queryPairsByTable = rowsByTable.ToDictionary(
+            table => table.Key,
+            table => table.Value
+                .SelectMany(entry => entry.Row.GetProperty("fields").EnumerateObject()
+                    .Select(field => new
+                    {
+                        Header = field.Name,
+                        Value = GetStructuredScalarValue(field.Value),
+                        NormalizedHeader = NormalizeStructuredValue(field.Name),
+                        NormalizedValue = NormalizeStructuredValue(GetStructuredScalarValue(field.Value))
+                    }))
+                .Where(item => item.NormalizedValue.Length >= 2 &&
+                               normalizedQuery.Contains(
+                                   $" {item.NormalizedValue} ",
+                                   StringComparison.Ordinal))
+                .DistinctBy(item =>
+                    $"{item.NormalizedHeader}|{item.NormalizedValue}")
+                .ToList(),
+            StringComparer.Ordinal);
+        var allObservedPairs = queryPairsByTable.Values
+            .SelectMany(pairs => pairs)
+            .ToList();
+        var allHeaders = rowsByTable.Values
+            .SelectMany(entries => entries)
+            .SelectMany(entry => entry.Row.GetProperty("fields")
+                .EnumerateObject()
+                .Select(field => field.Name))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var mentionedHeaders = BuildHeaderAliases(allHeaders)
+            .Where(alias => normalizedQuery.Contains(
+                $" {NormalizeStructuredValue(alias.Alias)} ",
+                StringComparison.Ordinal))
+            .Select(alias => NormalizeStructuredValue(alias.Header))
+            .ToHashSet(StringComparer.Ordinal);
+        var mentionedHeaderValues = mentionedHeaders
+            .Select(header => allHeaders.First(item =>
+                NormalizeStructuredValue(item) == header))
+            .Select(NormalizeStructuredValue)
+            .ToHashSet(StringComparer.Ordinal);
+        var headerByValue = allObservedPairs
+            .GroupBy(item => item.NormalizedValue, StringComparer.Ordinal)
+            .ToDictionary(
+                group => group.Key,
+                group => group.Select(item => item.NormalizedHeader)
+                    .Distinct(StringComparer.Ordinal)
+                    .ToHashSet(StringComparer.Ordinal),
+                StringComparer.Ordinal);
+
+        foreach (var (tableKey, entries) in rowsByTable)
+        {
+            var observedPairs = queryPairsByTable[tableKey];
+
+            if (observedPairs.Count == 0)
+                continue;
+
+            var headers = entries
+                .SelectMany(entry => entry.Row.GetProperty("fields")
+                    .EnumerateObject()
+                    .Select(field => field.Name))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            var matchedValues = observedPairs
+                .Select(pair => pair.NormalizedValue)
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+            var filters = new List<StructuredFilter>();
+            var deferredPairs = new List<(string Value, List<string> Headers)>();
+
+            foreach (var valueGroup in observedPairs.GroupBy(
+                         pair => pair.NormalizedValue,
+                         StringComparer.Ordinal))
+            {
+                var valueHeaders = valueGroup
+                    .Select(pair => NormalizeStructuredValue(pair.Header))
+                    .Distinct(StringComparer.Ordinal)
+                    .ToList();
+                if (mentionedHeaderValues.Contains(valueGroup.Key) &&
+                    !valueHeaders.Any(mentionedHeaders.Contains))
+                {
+                    continue;
+                }
+
+                var explicitHeaders = valueHeaders
+                    .Where(mentionedHeaders.Contains)
+                    .ToList();
+
+                if (explicitHeaders.Count == 0 &&
+                    matchedValues.Any(other =>
+                        other.Length > valueGroup.Key.Length &&
+                        IsContainedPhrase(valueGroup.Key, other)))
+                {
+                    continue;
+                }
+
+                var globallyMentionedHeaders = headerByValue[valueGroup.Key]
+                    .Where(mentionedHeaders.Contains)
+                    .ToList();
+                var selectedHeaders = globallyMentionedHeaders.Count > 0
+                    ? valueHeaders.Intersect(globallyMentionedHeaders, StringComparer.Ordinal).ToList()
+                    : explicitHeaders.Count > 0
+                        ? explicitHeaders
+                        : valueHeaders.Count == 1 &&
+                          headerByValue[valueGroup.Key].Count == 1
+                            ? valueHeaders
+                            : new List<string>();
+
+                if (selectedHeaders.Count == 0 &&
+                    valueHeaders.Count == 1 &&
+                    !mentionedHeaderValues.Contains(valueGroup.Key))
+                {
+                    deferredPairs.Add((valueGroup.First().Value, valueHeaders));
+                }
+
+                foreach (var header in selectedHeaders)
+                {
+                    var originalHeader = headers.First(item =>
+                        NormalizeStructuredValue(item) == header);
+                    AddStructuredFilter(filters, originalHeader, valueGroup.First().Value);
+                }
+            }
+
+            if (filters.Count > 0)
+            {
+                foreach (var (value, deferredHeaders) in deferredPairs)
+                {
+                    var header = headers.First(item =>
+                        NormalizeStructuredValue(item) == deferredHeaders[0]);
+                    AddStructuredFilter(filters, header, value);
+                }
+            }
+
+            var distinctFilters = filters
+                .DistinctBy(filter =>
+                    $"{NormalizeStructuredValue(filter.Field)}|{NormalizeStructuredValue(filter.Value)}")
+                .ToList();
+            if (distinctFilters.Count > 0)
+                filtersByTable.Add(tableKey, distinctFilters);
+        }
+
+        return filtersByTable;
+    }
+
+    private static bool IsContainedPhrase(string phrase, string largerPhrase) =>
+        $" {largerPhrase} ".Contains($" {phrase} ", StringComparison.Ordinal);
+
+    private static string GetStructuredScalarValue(JsonElement value)
+    {
+        return value.ValueKind switch
+        {
+            JsonValueKind.String => value.GetString() ?? string.Empty,
+            JsonValueKind.Number => value.ToString(),
+            JsonValueKind.True => "true",
+            JsonValueKind.False => "false",
+            _ => string.Empty
+        };
+    }
+
+    private static HashSet<string> FindRequestedTableKeys(
+        string query,
+        IReadOnlyList<StructuredPayloadRows> payloadRows)
+    {
+        var normalizedQuery = $" {NormalizeStructuredValue(query)} ";
+        var matches = payloadRows
+            .SelectMany(payload => new[]
+                {
+                    GetPayloadValue(payload.Point, "sheetName"),
+                    GetPayloadValue(payload.Point, "tableContext")
+                }
+                .Where(label => !string.IsNullOrWhiteSpace(label))
+                .Select(label => new
+                {
+                    Key = GetStructuredTableKey(payload),
+                    Label = NormalizeStructuredValue(label)
+                }))
+            .Where(item => item.Label.Length >= 3 &&
+                           normalizedQuery.Contains($" {item.Label} ", StringComparison.Ordinal))
+            .ToList();
+
+        if (matches.Count == 0)
+            return new HashSet<string>(StringComparer.Ordinal);
+
+        var longestLabelLength = matches.Max(item => item.Label.Length);
+        return matches
+            .Where(item => item.Label.Length == longestLabelLength)
+            .Select(item => item.Key)
+            .ToHashSet(StringComparer.Ordinal);
+    }
+
+    private static string GetStructuredTableKey(StructuredPayloadRows payload)
+    {
+        var tableId = GetPayloadValue(payload.Point, "tableId");
+        if (!string.IsNullOrWhiteSpace(tableId))
+            return tableId;
+
+        return string.Join(
+            "|",
+            GetPayloadValue(payload.Point, "documentId"),
+            GetPayloadValue(payload.Point, "sheetName"),
+            GetPayloadValue(payload.Point, "tableContext"));
+    }
+
+    private static List<StructuredRowEntry> JoinStructuredRows(
+        IReadOnlyList<StructuredRowEntry> sourceRows,
+        IReadOnlyList<StructuredRowEntry> targetRows)
+    {
+        if (sourceRows.Count == 0 || targetRows.Count == 0)
+            return new List<StructuredRowEntry>();
+
+        var sourceFields = GetUniqueFieldValues(sourceRows);
+        var targetFields = GetUniqueFieldValues(targetRows);
+        var sharedJoinFields = sourceFields.Keys
+            .Intersect(targetFields.Keys, StringComparer.Ordinal)
+            .Where(field =>
+            {
+                var sourceValues = sourceFields[field];
+                var targetValues = targetFields[field];
+                return sourceValues.Count > 0 &&
+                       targetValues.Count > 0 &&
+                       sourceValues.Count == sourceRows.Count &&
+                       targetValues.Count == targetRows.Count &&
+                       sourceValues.Overlaps(targetValues);
+            })
+            .ToHashSet(StringComparer.Ordinal);
+
+        if (sharedJoinFields.Count == 0)
+            return new List<StructuredRowEntry>();
+
+        var sourceKeys = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var entry in sourceRows)
+        {
+            foreach (var field in entry.Row.GetProperty("fields").EnumerateObject())
+            {
+                var normalizedHeader = NormalizeStructuredValue(field.Name);
+                var value = NormalizeStructuredValue(GetStructuredScalarValue(field.Value));
+                if (sharedJoinFields.Contains(normalizedHeader) && value.Length > 0)
+                    sourceKeys.Add($"{normalizedHeader}|{value}");
+            }
+        }
+
+        return targetRows
+            .Where(entry => entry.Row.GetProperty("fields").EnumerateObject()
+                .Any(field =>
+                {
+                    var normalizedHeader = NormalizeStructuredValue(field.Name);
+                    var value = NormalizeStructuredValue(GetStructuredScalarValue(field.Value));
+                    return sharedJoinFields.Contains(normalizedHeader) &&
+                           sourceKeys.Contains($"{normalizedHeader}|{value}");
+                }))
+            .Select(entry => entry with { MatchesFilters = true })
             .ToList();
     }
 
-    private async Task<IReadOnlyList<RetrievedPoint>> LoadAllPayloadsAsync()
+    private static Dictionary<string, HashSet<string>> GetUniqueFieldValues(
+        IReadOnlyList<StructuredRowEntry> rows)
     {
-        var response = await _client.ScrollAsync(
-            collectionName: CollectionName,
-            limit: 10000);
+        var valuesByField = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+        var countsByField = new Dictionary<string, int>(StringComparer.Ordinal);
 
-        return response.Result?.ToList() ?? [];
+        foreach (var row in rows)
+        {
+            foreach (var field in row.Row.GetProperty("fields").EnumerateObject())
+            {
+                var header = NormalizeStructuredValue(field.Name);
+                var value = NormalizeStructuredValue(GetStructuredScalarValue(field.Value));
+                if (value.Length == 0)
+                    continue;
+
+                if (!valuesByField.TryGetValue(header, out var values))
+                {
+                    values = new HashSet<string>(StringComparer.Ordinal);
+                    valuesByField.Add(header, values);
+                }
+
+                values.Add(value);
+                countsByField[header] = countsByField.GetValueOrDefault(header) + 1;
+            }
+        }
+
+        return valuesByField
+            .Where(entry =>
+                countsByField[entry.Key] == rows.Count &&
+                entry.Value.Count == rows.Count)
+            .ToDictionary(entry => entry.Key, entry => entry.Value, StringComparer.Ordinal);
+    }
+
+    private static IEnumerable<string> GetStructuredRowTextParts(JsonElement row)
+    {
+        if (!row.TryGetProperty("fields", out var fields) ||
+            fields.ValueKind != JsonValueKind.Object)
+        {
+            yield break;
+        }
+
+        foreach (var field in fields.EnumerateObject())
+        {
+            if (field.Value.ValueKind == JsonValueKind.String)
+            {
+                yield return field.Value.GetString() ?? string.Empty;
+            }
+            else if (field.Value.ValueKind == JsonValueKind.Number ||
+                     field.Value.ValueKind == JsonValueKind.True ||
+                     field.Value.ValueKind == JsonValueKind.False)
+            {
+                yield return field.Value.ToString();
+            }
+        }
+
+        if (row.TryGetProperty("rowText", out var rowText) &&
+            rowText.ValueKind == JsonValueKind.String)
+        {
+            yield return rowText.GetString() ?? string.Empty;
+        }
+
+        if (row.TryGetProperty("headerText", out var headerText) &&
+            headerText.ValueKind == JsonValueKind.String)
+        {
+            yield return headerText.GetString() ?? string.Empty;
+        }
+    }
+
+    private static IEnumerable<string> GetStructuredHeaderParts(JsonElement row)
+    {
+        if (!row.TryGetProperty("fields", out var fields) ||
+            fields.ValueKind != JsonValueKind.Object)
+        {
+            yield break;
+        }
+
+        foreach (var field in fields.EnumerateObject())
+        {
+            yield return field.Name;
+        }
+    }
+
+    private sealed class JsonElementRowComparer : IEqualityComparer<JsonElement>
+    {
+        public bool Equals(JsonElement x, JsonElement y)
+        {
+            return x.GetRawText().Equals(y.GetRawText(), StringComparison.Ordinal);
+        }
+
+        public int GetHashCode(JsonElement obj)
+        {
+            return obj.GetRawText().GetHashCode(StringComparison.Ordinal);
+        }
+    }
+
+    private async Task<IReadOnlyList<StructuredPayloadRows>> LoadStructuredRowsAsync()
+    {
+        var points = await _payloadCache.Value;
+        var payloadRows = new List<StructuredPayloadRows>();
+
+        foreach (var point in points)
+        {
+            if (!point.Payload.TryGetValue("structuredRowsJson", out var jsonValue) ||
+                jsonValue.KindCase != Value.KindOneofCase.StringValue ||
+                string.IsNullOrWhiteSpace(jsonValue.StringValue))
+            {
+                continue;
+            }
+
+            using var document = JsonDocument.Parse(jsonValue.StringValue);
+            var rows = document.RootElement.Clone();
+            if (rows.ValueKind != JsonValueKind.Array)
+                continue;
+
+            var headers = rows.EnumerateArray()
+                .Where(row => row.TryGetProperty("fields", out var fields) &&
+                              fields.ValueKind == JsonValueKind.Object)
+                .SelectMany(row => row.GetProperty("fields")
+                    .EnumerateObject()
+                    .Select(field => field.Name))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            payloadRows.Add(new StructuredPayloadRows(point, rows, headers));
+        }
+
+        return payloadRows;
+    }
+
+    private static IReadOnlyList<(string Header, string Alias)> BuildHeaderAliases(
+        IReadOnlyList<string> headers)
+    {
+        var wordsByHeader = headers.ToDictionary(
+            header => header,
+            header => Regex.Matches(header, @"[\p{L}\p{N}]+")
+                .Select(match => match.Value)
+                .ToList(),
+            StringComparer.OrdinalIgnoreCase);
+        var aliasCounts = wordsByHeader.Values
+            .SelectMany(words => words.Distinct(StringComparer.OrdinalIgnoreCase))
+            .GroupBy(word => word, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.Count(), StringComparer.OrdinalIgnoreCase);
+        var aliases = new List<(string Header, string Alias)>();
+
+        foreach (var (header, words) in wordsByHeader)
+        {
+            aliases.Add((header, header));
+            foreach (var word in words.Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                if (aliasCounts[word] == 1)
+                    aliases.Add((header, word));
+            }
+        }
+
+        return aliases
+            .DistinctBy(item =>
+                $"{NormalizeStructuredValue(item.Header)}|{NormalizeStructuredValue(item.Alias)}")
+            .ToList();
+    }
+
+    private static void AddStructuredFilter(
+        ICollection<StructuredFilter> filters,
+        string field,
+        string value)
+    {
+        var normalizedValue = value.Trim().Trim('"', '\'', '.', '?', '!', ';', ',');
+        if (normalizedValue.Length > 0)
+            filters.Add(new StructuredFilter(field, normalizedValue));
+    }
+
+    private static bool MatchesStructuredFilters(
+        JsonElement row,
+        IReadOnlyList<StructuredFilter> filters)
+    {
+        if (!row.TryGetProperty("fields", out var fields) ||
+            fields.ValueKind != JsonValueKind.Object)
+        {
+            return false;
+        }
+
+        foreach (var filter in filters)
+        {
+            var matched = false;
+
+            foreach (var field in fields.EnumerateObject())
+            {
+                var fieldName = NormalizeStructuredValue(field.Name);
+                var expectedField = NormalizeStructuredValue(filter.Field);
+                var actualValue = NormalizeStructuredValue(GetStructuredScalarValue(field.Value));
+                var expectedValue = NormalizeStructuredValue(filter.Value);
+
+                if (fieldName == expectedField && actualValue == expectedValue)
+                {
+                    matched = true;
+                    break;
+                }
+            }
+
+            if (matched)
+                continue;
+
+            return false;
+        }
+
+        return true;
+    }
+
+    private static string NormalizeStructuredValue(string value)
+    {
+        var trimmed = value.Trim();
+        var numeric = trimmed.Replace(",", string.Empty, StringComparison.Ordinal);
+
+        if (decimal.TryParse(
+                numeric,
+                NumberStyles.Any,
+                CultureInfo.InvariantCulture,
+                out var number))
+        {
+            return number.ToString("G29", CultureInfo.InvariantCulture);
+        }
+
+        return Regex.Replace(trimmed.ToLowerInvariant(), @"[^\p{L}\p{N}]+", " ");
     }
 
     private async Task<IReadOnlyList<RetrievedPoint>> SearchLexicalCandidatesAsync(
-        string query)
+        string query,
+        int limit)
     {
         var terms = Tokenize(query)
             .Where(term => term.Length >= 2 || term.Any(char.IsDigit))
@@ -502,48 +1557,119 @@ public class QdrantVectorStore : IVectorStore
         if (terms.Count == 0)
             return Array.Empty<RetrievedPoint>();
 
-        var points = await _payloadCache.Value;
+        var index = await _bm25Index.Value;
+        if (index.Documents.Count == 0)
+            return Array.Empty<RetrievedPoint>();
 
-        return points
-            .Select(point => new
+        var documents = terms
+            .Where(index.Postings.ContainsKey)
+            .SelectMany(term => index.Postings[term])
+            .DistinctBy(document => document.Point.Id.Num)
+            .ToList();
+        if (documents.Count == 0)
+            return Array.Empty<RetrievedPoint>();
+
+        var averageLength = Math.Max(index.AverageDocumentLength, 1);
+        var queryIdentifiers = ExtractQueryIdentifiers(query);
+        const double k1 = 1.2;
+        const double b = 0.75;
+
+        return documents
+            .Select(document =>
             {
-                Point = point,
-                Score = CalculateLexicalPayloadScore(point, terms, query)
+                var score = 0d;
+
+                foreach (var term in terms)
+                {
+                    if (!document.TermFrequencies.TryGetValue(term, out var frequency))
+                        continue;
+
+                    var documentFrequency =
+                        index.DocumentFrequencies.GetValueOrDefault(term);
+                    var inverseDocumentFrequency = Math.Log(
+                        1 + (documents.Count - documentFrequency + 0.5) /
+                        (documentFrequency + 0.5));
+                    var normalizedFrequency =
+                        frequency * (k1 + 1) /
+                        (frequency + k1 *
+                            (1 - b + b * document.Length / averageLength));
+                    score += inverseDocumentFrequency * normalizedFrequency;
+                }
+
+                if (queryIdentifiers.Count > 0)
+                {
+                    if (queryIdentifiers.Any(identifier =>
+                            document.Identifiers.Contains(
+                                identifier,
+                                StringComparer.OrdinalIgnoreCase)))
+                    {
+                        score += 10;
+                    }
+                }
+
+                return new { document.Point, Score = score };
             })
             .Where(candidate => candidate.Score > 0)
             .OrderByDescending(candidate => candidate.Score)
+            .Take(limit)
             .Select(candidate => candidate.Point)
             .ToList();
     }
 
-    private static int CalculateLexicalPayloadScore(
-        RetrievedPoint point,
-        IReadOnlyList<string> terms,
-        string query)
+    private async Task<Bm25Index> LoadBm25IndexAsync()
     {
-        var searchableText = string.Join(
-            " ",
-            GetPayloadValue(point, "documentName"),
-            GetPayloadValue(point, "relativePath"),
-            GetPayloadValue(point, "text"),
-            GetPayloadValue(point, "parentText"),
-            GetPayloadValue(point, "tableId"),
-            GetPayloadValue(point, "tableContext"),
-            GetPayloadValue(point, "searchText"));
+        var points = await _payloadCache.Value;
+        var documents = new List<Bm25Document>(points.Count);
+        var documentFrequencies = new Dictionary<string, int>(
+            StringComparer.OrdinalIgnoreCase);
+        var postings = new Dictionary<string, List<Bm25Document>>(
+            StringComparer.OrdinalIgnoreCase);
 
-        var documentTerms = Tokenize(searchableText).ToList();
-        var score = CalculateTokenMatchScore(documentTerms, terms);
-
-        var queryIdentifiers = ExtractQueryIdentifiers(query);
-        var documentIdentifiers = ExtractQueryIdentifiers(searchableText);
-
-        if (queryIdentifiers.Any(identifier =>
-                documentIdentifiers.Contains(identifier, StringComparer.OrdinalIgnoreCase)))
+        foreach (var point in points)
         {
-            score += 100;
+            var searchableText = string.Join(
+                " ",
+                GetPayloadValue(point, "documentName"),
+                GetPayloadValue(point, "relativePath"),
+                GetPayloadValue(point, "text"),
+                GetPayloadValue(point, "parentText"),
+                GetPayloadValue(point, "tableId"),
+                GetPayloadValue(point, "tableContext"),
+                GetPayloadValue(point, "searchText"));
+            var termFrequencies = Tokenize(searchableText)
+                .GroupBy(term => term, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(
+                    group => group.Key,
+                    group => group.Count(),
+                    StringComparer.OrdinalIgnoreCase);
+            var document = new Bm25Document(
+                point,
+                termFrequencies,
+                termFrequencies.Values.Sum(),
+                ExtractQueryIdentifiers(searchableText));
+            documents.Add(document);
+
+            foreach (var term in termFrequencies.Keys)
+            {
+                documentFrequencies[term] =
+                    documentFrequencies.GetValueOrDefault(term) + 1;
+                if (!postings.TryGetValue(term, out var termDocuments))
+                {
+                    termDocuments = [];
+                    postings.Add(term, termDocuments);
+                }
+                termDocuments.Add(document);
+            }
         }
 
-        return score;
+        return new Bm25Index(
+            documents,
+            documentFrequencies,
+            postings.ToDictionary(
+                entry => entry.Key,
+                entry => (IReadOnlyList<Bm25Document>)entry.Value,
+                StringComparer.OrdinalIgnoreCase),
+            documents.Count == 0 ? 0 : documents.Average(document => document.Length));
     }
 
     private static string GetPayloadValue(RetrievedPoint point, string key)
@@ -570,7 +1696,7 @@ public class QdrantVectorStore : IVectorStore
             "me", "please", "tell"
         };
 
-        return Regex.Matches(value.ToLowerInvariant(), @"[a-z]+|[0-9]+")
+        return Regex.Matches(value.ToLowerInvariant(), @"[\p{L}\p{N}]+")
             .Select(match => match.Value)
             .Select(NormalizeLexicalTerm)
             .Where(term => !stopWords.Contains(term))
@@ -597,87 +1723,9 @@ public class QdrantVectorStore : IVectorStore
         return term;
     }
 
-    private static int CalculateTokenMatchScore(
-        IReadOnlyList<string> documentTerms,
-        IReadOnlyList<string> queryTerms)
-    {
-        var documentSet = documentTerms.ToHashSet(StringComparer.OrdinalIgnoreCase);
-
-        var score = queryTerms
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .Sum(term => documentSet.Contains(term)
-                ? (term.Any(char.IsDigit) ? 10 : 1)
-                : 0);
-
-        for (var length = Math.Min(4, queryTerms.Count); length >= 2; length--)
-        {
-            for (var start = 0; start <= queryTerms.Count - length; start++)
-            {
-                var phrase = queryTerms.Skip(start).Take(length).ToList();
-
-                for (var documentStart = 0;
-                     documentStart <= documentTerms.Count - length;
-                     documentStart++)
-                {
-                    if (phrase.SequenceEqual(
-                        documentTerms.Skip(documentStart).Take(length),
-                        StringComparer.OrdinalIgnoreCase))
-                    {
-                        score += length * length;
-                        break;
-                    }
-                }
-            }
-        }
-
-        return score;
-    }
-
-    private static double CalculateLexicalBoost(
-        VectorSearchResult result,
-        string query)
-    {
-        var searchableText =
-            $"{result.DocumentName} " +
-            $"{result.RelativePath} " +
-            $"{result.Text} " +
-            $"{result.ParentText}";
-
-        var normalizedQuery = NormalizeForSearch(query);
-        var normalizedText = NormalizeForSearch(
-            NormalizeVersionAliases(searchableText));
-
-        if (string.IsNullOrWhiteSpace(normalizedQuery) ||
-            string.IsNullOrWhiteSpace(normalizedText))
-        {
-            return 0;
-        }
-
-        var queryTerms = Tokenize(query)
-            .Where(term => term.Length >= 2 || term.Any(char.IsDigit))
-            .ToList();
-
-        double boost = CalculateTokenMatchScore(
-            Tokenize(normalizedText), queryTerms);
-
-        var queryIdentifiers = ExtractQueryIdentifiers(query);
-        var documentIdentifiers = ExtractQueryIdentifiers(searchableText);
-
-        foreach (var identifier in queryIdentifiers)
-        {
-            if (documentIdentifiers.Contains(identifier, StringComparer.OrdinalIgnoreCase))
-                boost += 100;
-        }
-
-        if (normalizedText.Contains(normalizedQuery, StringComparison.OrdinalIgnoreCase))
-            boost += queryTerms.Count;
-
-        return boost;
-    }
-
     private static string NormalizeForSearch(string value)
     {
-        return Regex.Replace(value.ToLowerInvariant(), @"[^a-z0-9]+", " ").Trim();
+        return Regex.Replace(value.ToLowerInvariant(), @"[^\p{L}\p{N}]+", " ").Trim();
     }
 
     public static string NormalizeVersionAliases(string value)
@@ -719,7 +1767,19 @@ public class QdrantVectorStore : IVectorStore
         if (versionMatch.Success)
             return versionMatch.Groups[1].Value;
 
-        return value.Trim().ToLowerInvariant();
+        return NormalizeIdentifierValue(value);
+    }
+
+    private static string NormalizeIdentifierValue(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return string.Empty;
+
+        var normalized = value.Trim();
+        normalized = normalized.Trim('"', '\'', '`', '[', ']', '(', ')', '{', '}', '.', ',', ';', ':', '!', '?');
+        normalized = normalized.Replace('_', '-');
+        normalized = normalized.Replace(' ', '-');
+        return normalized.ToLowerInvariant();
     }
 
     private static bool ContainsAllIdentifierTokens(
@@ -757,7 +1817,11 @@ public class QdrantVectorStore : IVectorStore
             RelativePath = GetPayloadValue(point, "relativePath"),
             PageNumber = point.Payload.TryGetValue("pageNumber", out var pn) ? (int?)pn.IntegerValue : null,
             SheetName = point.Payload.TryGetValue("sheetName", out var sn) ? sn.StringValue : null,
-            SqlObjectType = point.Payload.TryGetValue("sqlObjectType", out var sot) ? sot.StringValue : null
+            SqlObjectType = point.Payload.TryGetValue("sqlObjectType", out var sot) ? sot.StringValue : null,
+            RowStartIndex = point.Payload.TryGetValue("rowStartIndex", out var rsi) ? (int?)rsi.IntegerValue : null,
+            RowEndIndex = point.Payload.TryGetValue("rowEndIndex", out var rei) ? (int?)rei.IntegerValue : null,
+            RowIdentifiers = GetPayloadStringArray(point.Payload, "rowIdentifiers"),
+            StructuredRowsJson = GetPayloadValue(point, "structuredRowsJson")
         };
     }
 
@@ -780,8 +1844,75 @@ public class QdrantVectorStore : IVectorStore
             RelativePath = GetPayloadValue(point, "relativePath"),
             PageNumber = point.Payload.TryGetValue("pageNumber", out var pn) ? (int?)pn.IntegerValue : null,
             SheetName = point.Payload.TryGetValue("sheetName", out var sn) ? sn.StringValue : null,
-            SqlObjectType = point.Payload.TryGetValue("sqlObjectType", out var sot) ? sot.StringValue : null
+            SqlObjectType = point.Payload.TryGetValue("sqlObjectType", out var sot) ? sot.StringValue : null,
+            RowStartIndex = point.Payload.TryGetValue("rowStartIndex", out var rsi) ? (int?)rsi.IntegerValue : null,
+            RowEndIndex = point.Payload.TryGetValue("rowEndIndex", out var rei) ? (int?)rei.IntegerValue : null,
+            RowIdentifiers = GetPayloadStringArray(point.Payload, "rowIdentifiers"),
+            StructuredRowsJson = GetPayloadValue(point, "structuredRowsJson")
         };
+    }
+
+    private static IReadOnlyList<string> GetPayloadStringArray(
+        Google.Protobuf.Collections.MapField<string, Value> payload,
+        string key)
+    {
+        if (!payload.TryGetValue(key, out var value) ||
+            value.KindCase != Value.KindOneofCase.ListValue)
+        {
+            return Array.Empty<string>();
+        }
+
+        return value.ListValue.Values
+            .Where(item => item.KindCase == Value.KindOneofCase.StringValue)
+            .Select(item => item.StringValue)
+            .ToList();
+    }
+
+    private sealed record StructuredFilter(string Field, string Value);
+
+    private enum StructuredComparison
+    {
+        GreaterThan,
+        GreaterThanOrEqual,
+        LessThan,
+        LessThanOrEqual,
+        Equal
+    }
+
+    private enum StructuredExtremum
+    {
+        Maximum,
+        Minimum
+    }
+
+    private sealed record StructuredPayloadRows(
+        RetrievedPoint Point,
+        JsonElement Rows,
+        IReadOnlyList<string> Headers);
+
+    private sealed record StructuredRowEntry(
+        StructuredPayloadRows Payload,
+        JsonElement Row,
+        bool MatchesFilters);
+
+    private sealed record Bm25Document(
+        RetrievedPoint Point,
+        IReadOnlyDictionary<string, int> TermFrequencies,
+        int Length,
+        IReadOnlyList<string> Identifiers);
+
+    private sealed record Bm25Index(
+        IReadOnlyList<Bm25Document> Documents,
+        IReadOnlyDictionary<string, int> DocumentFrequencies,
+        IReadOnlyDictionary<string, IReadOnlyList<Bm25Document>> Postings,
+        double AverageDocumentLength);
+
+    private sealed record StructuredSearchResult(
+        bool IsApplicable,
+        IReadOnlyList<VectorSearchResult> Results)
+    {
+        public static StructuredSearchResult NotApplicable { get; } =
+            new(false, Array.Empty<VectorSearchResult>());
     }
 
     private static string CleanQueryForFullText(string query)

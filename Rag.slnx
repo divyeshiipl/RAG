@@ -1,4 +1,11 @@
 <Solution>
+  <Folder Name="/Project Help/">
+    <File Path="Project Help/Insatllation_Requirements.pdf" />
+    <File Path="Project Help/RAG POC Tech Design - OLD.docx" />
+    <File Path="Project Help/RAG POC Tech Design.docx" />
+    <File Path="Project Help/RAG Technical Documentation - OLD.docx" />
+    <File Path="Project Help/RAG Technical Documentation.docx" />
+  </Folder>
   <Project Path="Rag.DocumentProcessing.Console/Rag.DocumentProcessing.Console.csproj" Id="d83572c4-c90b-42ed-b453-cef05b96babc" />
   <Project Path="Rag.DocumentProcessing/Rag.DocumentProcessing.csproj" Id="7bc96c69-cd21-4b4f-9556-b7e6cd5ebb0d" />
   <Project Path="Rag.EmbeddingGenerator.Console/Rag.EmbeddingGenerator.Console.csproj" Id="7131ba3e-0b28-4014-aed5-db7ec14d372f" />
