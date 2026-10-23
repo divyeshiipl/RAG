@@ -178,6 +178,9 @@ public class QdrantVectorStore : IVectorStore
         int limit = 5)
     {
         var normalizedQuery = NormalizeVersionAliases(queryText);
+        var structuredSearch = await SearchStructuredRowsAsync(normalizedQuery);
+        if (structuredSearch.IsApplicable && structuredSearch.Results.Count > 0)
+            return structuredSearch.Results;
 
         var candidateLimit = Math.Clamp(
             limit * CandidateMultiplier,
@@ -199,13 +202,40 @@ public class QdrantVectorStore : IVectorStore
 
         var semanticResults = await semanticTask;
         var lexicalResults = await lexicalTask;
+        var queryIdentifiers = ExtractQueryIdentifiers(normalizedQuery);
+        var exactIdentifierPoints = queryIdentifiers.Count == 0
+            ? Array.Empty<RetrievedPoint>()
+            : (await _payloadCache.Value)
+                .Where(point => queryIdentifiers.Any(identifier =>
+                    ContainsIdentifier(point, identifier)))
+                .ToArray();
+        var exactMetadataPoints = queryIdentifiers.Count == 0
+            ? Array.Empty<RetrievedPoint>()
+            : (await _payloadCache.Value)
+                .Where(point => queryIdentifiers.Any(identifier =>
+                    ContainsIdentifierInMetadata(point, identifier)))
+                .ToArray();
+        var exactSourcePoints = exactMetadataPoints.Length > 0
+            ? exactMetadataPoints
+            : exactIdentifierPoints;
+        var exactIdentifierDocumentIds = exactSourcePoints
+            .Select(point => GetPayloadValue(point, "documentId"))
+            .Where(documentId => !string.IsNullOrWhiteSpace(documentId))
+            .ToHashSet(StringComparer.Ordinal);
 
         var candidateResults = semanticResults
             .Select(MapToResult)
             .Concat(lexicalResults.Select(MapRetrievedToResult))
+            .Concat(exactSourcePoints.Select(MapRetrievedToResult))
             .GroupBy(x => x.Id)
             .Select(group => group.First())
             .ToList();
+        if (exactIdentifierDocumentIds.Count > 0)
+        {
+            candidateResults = candidateResults
+                .Where(result => exactIdentifierDocumentIds.Contains(result.DocumentId))
+                .ToList();
+        }
 
         const int reciprocalRankConstant = 60;
         var fusedScores = new Dictionary<ulong, double>();
@@ -224,8 +254,6 @@ public class QdrantVectorStore : IVectorStore
                 1d / (reciprocalRankConstant + rank + 1);
         }
 
-        var queryIdentifiers = ExtractQueryIdentifiers(queryText);
-
         var identifierMatches = candidateResults
             .Where(result =>
                 queryIdentifiers.Count > 0 &&
@@ -237,10 +265,16 @@ public class QdrantVectorStore : IVectorStore
         {
             candidate.Score = (float)(
                 fusedScores.GetValueOrDefault(candidate.Id) * 1000 +
-                (identifierMatches.Contains(candidate.Id) ? 100 : 0));
+                (identifierMatches.Contains(candidate.Id) ? 1000 : 0) +
+                (queryIdentifiers.Any(identifier =>
+                    ContainsIdentifierInMetadata(candidate, identifier))
+                    ? 2000
+                    : 0) +
+                GetQueryCoverageScore(candidate, normalizedQuery));
         }
 
         var selected = SelectMinimumChunks(queryText, candidateResults);
+        selected = await AddAdjacentChunksAsync(selected);
 
         var rankedResults = selected
             .OrderByDescending(r => r.Score)
@@ -252,12 +286,7 @@ public class QdrantVectorStore : IVectorStore
         var textResults = rankedResults
             .Where(result =>
             {
-                var content = !string.IsNullOrWhiteSpace(result.TableId)
-                    ? result.Text
-                    : string.IsNullOrWhiteSpace(result.ParentText)
-                        ? result.Text
-                        : result.ParentText;
-                var normalizedContent = NormalizeForSearch(content);
+                var normalizedContent = NormalizeForSearch(result.Text);
                 return string.IsNullOrWhiteSpace(normalizedContent) ||
                        seenContent.Add(normalizedContent);
             })
@@ -272,12 +301,65 @@ public class QdrantVectorStore : IVectorStore
         if (relevantDocumentIds.Count == 0)
             return textResults;
 
-        var structuredSearch = await SearchStructuredRowsAsync(
+        structuredSearch = await SearchStructuredRowsAsync(
             normalizedQuery,
             relevantDocumentIds);
         return structuredSearch.IsApplicable && structuredSearch.Results.Count > 0
             ? structuredSearch.Results
             : textResults;
+    }
+
+    private async Task<List<VectorSearchResult>> AddAdjacentChunksAsync(
+        IReadOnlyList<VectorSearchResult> selected)
+    {
+        if (selected.Count == 0)
+            return selected.ToList();
+
+        var points = await _payloadCache.Value;
+        var pointsByDocumentAndChunk = points
+            .Where(point =>
+                point.Payload.TryGetValue("chunkNumber", out var chunkNumber) &&
+                chunkNumber.KindCase == Value.KindOneofCase.IntegerValue)
+            .GroupBy(point => (
+                DocumentId: GetPayloadValue(point, "documentId"),
+                ChunkNumber: (int)point.Payload["chunkNumber"].IntegerValue))
+            .ToDictionary(group => group.Key, group => group.First());
+        var expanded = selected.ToDictionary(result => result.Id);
+
+        foreach (var seed in selected
+                     .GroupBy(result => result.DocumentId, StringComparer.Ordinal)
+                     .SelectMany(group => group
+                         .OrderByDescending(result => result.Score)
+                         .Take(3)))
+        {
+            if (string.IsNullOrWhiteSpace(seed.DocumentId) ||
+                seed.ChunkNumber <= 0)
+            {
+                continue;
+            }
+
+            foreach (var adjacentChunkNumber in new[]
+                     {
+                         seed.ChunkNumber - 1,
+                         seed.ChunkNumber + 1
+                     })
+            {
+                if (adjacentChunkNumber <= 0 ||
+                    !pointsByDocumentAndChunk.TryGetValue(
+                        (seed.DocumentId, adjacentChunkNumber),
+                        out var point) ||
+                    expanded.ContainsKey(point.Id.Num))
+                {
+                    continue;
+                }
+
+                var adjacent = MapRetrievedToResult(point);
+                adjacent.Score = seed.Score * 0.8f;
+                expanded.Add(adjacent.Id, adjacent);
+            }
+        }
+
+        return expanded.Values.ToList();
     }
 
     public async Task<IReadOnlyList<VectorSearchResult>> GetDocumentChunksAsync(
@@ -393,12 +475,11 @@ public class QdrantVectorStore : IVectorStore
             return new List<VectorSearchResult>();
 
         var intent = DetectQueryIntent(queryText);
-        var queryIdentifiers = ExtractQueryIdentifiers(queryText);
         var rerankedCandidates = candidates
             .Select(candidate => new
             {
                 Candidate = candidate,
-                Score = GetConfidenceScore(candidate, queryIdentifiers)
+                Score = GetConfidenceScore(candidate)
             })
             .ToList();
         var topScore = rerankedCandidates.Max(candidate => candidate.Score);
@@ -430,7 +511,7 @@ public class QdrantVectorStore : IVectorStore
             .Select(g => new
             {
                 Key = g.Key,
-                TopScore = g.Max(x => GetConfidenceScore(x, queryIdentifiers)),
+                TopScore = g.Max(GetConfidenceScore),
                 Chunks = g.OrderBy(x => x.ChunkNumber).ToList()
             })
             .OrderByDescending(g => g.TopScore)
@@ -482,7 +563,7 @@ public class QdrantVectorStore : IVectorStore
 
         var result = picked
             .SelectMany(g => g.Chunks)
-            .Where(chunk => GetConfidenceScore(chunk, queryIdentifiers) >= chunkCutoff)
+            .Where(chunk => GetConfidenceScore(chunk) >= chunkCutoff)
             .GroupBy(c => c.Id)
             .Select(g => g.First())
             .OrderByDescending(c => c.Score)
@@ -494,19 +575,112 @@ public class QdrantVectorStore : IVectorStore
             .ToList();
     }
 
-    private static double GetConfidenceScore(
+    private static double GetConfidenceScore(VectorSearchResult candidate) =>
+        Math.Max(0, candidate.Score);
+
+    private static double GetQueryCoverageScore(
         VectorSearchResult candidate,
-        IReadOnlyList<string> queryIdentifiers)
+        string query)
     {
-        var score = candidate.Score;
-        if (queryIdentifiers.Count > 0 &&
-            ContainsAllIdentifierTokens(candidate, queryIdentifiers))
+        var queryTerms = Tokenize(query)
+            .Where(term => term.Length >= 2 || term.Any(char.IsDigit))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (queryTerms.Count == 0)
+            return 0;
+
+        var searchableText = NormalizeForSearch(string.Join(
+            " ",
+            candidate.DocumentName,
+            candidate.RelativePath,
+            candidate.Text,
+            candidate.TableContext,
+            string.Join(" ", candidate.RowIdentifiers)));
+        var matchingTerms = queryTerms.Count(term =>
+            searchableText.Contains(
+                NormalizeForSearch(term),
+                StringComparison.OrdinalIgnoreCase));
+
+        return 40d * matchingTerms / queryTerms.Count +
+               GetTableRelationScore(candidate, queryTerms);
+    }
+
+    private static double GetTableRelationScore(
+        VectorSearchResult candidate,
+        IReadOnlyList<string> queryTerms)
+    {
+        var source = string.Join(Environment.NewLine, candidate.Text, candidate.ParentText);
+        var lines = source.Split(
+            new[] { "\r\n", "\n" },
+            StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var score = 0d;
+
+        for (var lineIndex = 0; lineIndex + 2 < lines.Length; lineIndex++)
         {
-            score -= 100;
+            if (!IsMarkdownTableRow(lines[lineIndex]) ||
+                !IsMarkdownTableSeparator(lines[lineIndex + 1]))
+            {
+                continue;
+            }
+
+            var headers = SplitMarkdownTableRow(lines[lineIndex]);
+            if (headers.Count == 0)
+                continue;
+
+            var targetColumns = headers
+                .Select((header, index) => new
+                {
+                    Index = index,
+                    Terms = Tokenize(header)
+                })
+                .Where(header => header.Terms.Any(queryTerms.Contains))
+                .Select(header => header.Index)
+                .ToHashSet();
+            if (targetColumns.Count == 0)
+                continue;
+
+            for (var rowIndex = lineIndex + 2;
+                 rowIndex < lines.Length && IsMarkdownTableRow(lines[rowIndex]);
+                 rowIndex++)
+            {
+                var cells = SplitMarkdownTableRow(lines[rowIndex]);
+                var matchedEntityColumns = cells
+                    .Select((cell, index) => new { Index = index, Cell = cell })
+                    .Where(item =>
+                        !targetColumns.Contains(item.Index) &&
+                        Tokenize(item.Cell).Any(queryTerms.Contains))
+                    .Select(item => item.Index)
+                    .ToList();
+                if (matchedEntityColumns.Count == 0)
+                    continue;
+
+                score += 90;
+            }
+
+            lineIndex++;
         }
 
-        return Math.Max(0, score);
+        return score;
     }
+
+    private static bool IsMarkdownTableRow(string line) =>
+        line.StartsWith('|') && line.EndsWith('|');
+
+    private static bool IsMarkdownTableSeparator(string line)
+    {
+        if (!IsMarkdownTableRow(line))
+            return false;
+
+        return SplitMarkdownTableRow(line).All(cell =>
+            Regex.IsMatch(cell, @"^:?-{3,}:?$"));
+    }
+
+    private static IReadOnlyList<string> SplitMarkdownTableRow(string line) =>
+        line.Split('|')
+            .Skip(1)
+            .SkipLast(1)
+            .Select(cell => cell.Trim())
+            .ToList();
 
     private enum QueryIntent
     {
@@ -582,15 +756,20 @@ public class QdrantVectorStore : IVectorStore
 
     private async Task<StructuredSearchResult> SearchStructuredRowsAsync(
         string query,
-        IReadOnlySet<string> relevantDocumentIds)
+        IReadOnlySet<string>? relevantDocumentIds = null)
     {
         var payloadRows = await _structuredRowsCache.Value;
-        if (payloadRows.Count == 0 || relevantDocumentIds.Count == 0)
+        if (payloadRows.Count == 0)
             return StructuredSearchResult.NotApplicable;
-        payloadRows = payloadRows
-            .Where(payload => relevantDocumentIds.Contains(
-                GetPayloadValue(payload.Point, "documentId")))
-            .ToList();
+        if (relevantDocumentIds is not null)
+        {
+            if (relevantDocumentIds.Count == 0)
+                return StructuredSearchResult.NotApplicable;
+            payloadRows = payloadRows
+                .Where(payload => relevantDocumentIds.Contains(
+                    GetPayloadValue(payload.Point, "documentId")))
+                .ToList();
+        }
         if (payloadRows.Count == 0)
             return StructuredSearchResult.NotApplicable;
 
@@ -632,6 +811,58 @@ public class QdrantVectorStore : IVectorStore
         var highestHeaderMatchCount = headerMatchesByTable.Values
             .DefaultIfEmpty()
             .Max();
+        var hasYearFilter = Regex.IsMatch(
+            query,
+            @"(?<![\p{L}\p{N}_-])(?:19|20)\d{2}(?![\p{L}\p{N}_-])");
+        var hasStructuredOperation =
+            GetStructuredExtremum(query) is not null ||
+            GetStructuredComparison(query) is not null ||
+            hasYearFilter ||
+            Regex.IsMatch(
+                query,
+                @"\b(?:more\s+than\s+once|multiple\s+times|duplicat(?:e|es|ed|ion)|repeated)\b",
+                RegexOptions.IgnoreCase);
+        var hasExactStructuredIdentifier = ExtractQueryIdentifiers(query)
+            .Any(identifier => rowsByTable.Values
+                .SelectMany(rows => rows)
+                .Any(entry => entry.Row.GetProperty("fields")
+                    .EnumerateObject()
+                    .Any(field => string.Equals(
+                        NormalizeStructuredValue(GetStructuredScalarValue(field.Value)),
+                        NormalizeStructuredValue(identifier),
+                        StringComparison.Ordinal))));
+        var hasExplicitTableReference = requestedTableKeys.Count > 0 &&
+            payloadRows
+                .Where(payload => requestedTableKeys.Contains(
+                    GetStructuredTableKey(payload)))
+                .SelectMany(payload => new[]
+                {
+                    GetPayloadValue(payload.Point, "sheetName"),
+                    GetPayloadValue(payload.Point, "tableContext")
+                })
+                .Where(label => !string.IsNullOrWhiteSpace(label))
+                .Any(label => Regex.IsMatch(
+                    NormalizeStructuredValue(query),
+                    $@"\b(?:in|from|of|within|for)\s+{Regex.Escape(NormalizeStructuredValue(label))}\b",
+                    RegexOptions.IgnoreCase));
+        var requestsCompleteSet = Regex.IsMatch(
+            query,
+            @"\b(?:all|every|each|list|enumerate)\b",
+            RegexOptions.IgnoreCase);
+        var hasDuplicateOperation = Regex.IsMatch(
+            query,
+            @"\b(?:more\s+than\s+once|multiple\s+times|duplicat(?:e|es|ed|ion)|repeated)\b",
+            RegexOptions.IgnoreCase);
+        var hasStrongStructuredIntent =
+            hasExplicitTableReference ||
+            hasExactStructuredIdentifier ||
+            hasStructuredOperation && highestHeaderMatchCount > 0 ||
+            hasDuplicateOperation && highestHeaderMatchCount > 0 ||
+            requestsCompleteSet && filtersByTable.Count > 0 ||
+            relevantDocumentIds is not null && filtersByTable.Count > 0;
+        if (!hasStrongStructuredIntent)
+            return StructuredSearchResult.NotApplicable;
+
         if (filtersByTable.Count == 0 &&
             requestedTableKeys.Count == 0 &&
             highestHeaderMatchCount == 0)
@@ -1797,6 +2028,81 @@ public class QdrantVectorStore : IVectorStore
                 NormalizeForSearch(identifier),
                 StringComparison.OrdinalIgnoreCase));
     }
+
+    private static bool ContainsIdentifier(
+        RetrievedPoint point,
+        string identifier)
+    {
+        var normalizedIdentifier = NormalizeForSearch(identifier);
+        if (normalizedIdentifier.Length == 0)
+            return false;
+
+        var searchableText = NormalizeForSearch(string.Join(
+            " ",
+            GetPayloadValue(point, "documentName"),
+            GetPayloadValue(point, "relativePath"),
+            GetPayloadValue(point, "text"),
+            GetPayloadValue(point, "parentText"),
+            GetPayloadValue(point, "tableContext"),
+            GetPayloadValue(point, "searchText"),
+            GetPayloadValue(point, "structuredRowsJson"),
+            string.Join(" ", GetPayloadStringArray(point.Payload, "rowIdentifiers"))));
+
+        return $" {searchableText} ".Contains(
+            $" {normalizedIdentifier} ",
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool ContainsIdentifierInMetadata(
+        VectorSearchResult result,
+        string identifier)
+    {
+        if (IsVersionIdentifier(identifier))
+        {
+            var metadata = $"{result.DocumentName} {result.RelativePath}";
+            return ContainsVersionIdentifier(metadata, identifier);
+        }
+
+        var normalizedIdentifier = NormalizeForSearch(identifier);
+        var normalizedMetadata = NormalizeForSearch(
+            $"{result.DocumentName} {result.RelativePath}");
+
+        return normalizedIdentifier.Length > 0 &&
+               $" {normalizedMetadata} ".Contains(
+                   $" {normalizedIdentifier} ",
+                   StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool ContainsIdentifierInMetadata(
+        RetrievedPoint point,
+        string identifier)
+    {
+        if (IsVersionIdentifier(identifier))
+        {
+            var metadata = $"{GetPayloadValue(point, "documentName")} " +
+                           GetPayloadValue(point, "relativePath");
+            return ContainsVersionIdentifier(metadata, identifier);
+        }
+
+        var normalizedIdentifier = NormalizeForSearch(identifier);
+        var normalizedMetadata = NormalizeForSearch(
+            $"{GetPayloadValue(point, "documentName")} " +
+            GetPayloadValue(point, "relativePath"));
+
+        return normalizedIdentifier.Length > 0 &&
+               $" {normalizedMetadata} ".Contains(
+                   $" {normalizedIdentifier} ",
+                   StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsVersionIdentifier(string identifier) =>
+        Regex.IsMatch(identifier, @"^\d+(?:\.\d+)+$");
+
+    private static bool ContainsVersionIdentifier(string text, string identifier) =>
+        Regex.IsMatch(
+            text,
+            $@"(?<![\p{{L}}\p{{N}}])(?:v(?:ersion)?\s*)?{Regex.Escape(identifier)}(?![\p{{L}}\p{{N}}])",
+            RegexOptions.IgnoreCase);
 
     private VectorSearchResult MapToResult(ScoredPoint point)
     {

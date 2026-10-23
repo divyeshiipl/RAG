@@ -1,12 +1,22 @@
 using Rag.VectorStore.Models;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
 namespace Rag.VectorStore.Services;
 
 public static class StructuredQueryAnswerFormatter
 {
     public const string NotFoundAnswer = "Not found in the provided documentation.";
+    private static readonly HashSet<string> StructuralHeadingWords =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            "Layer", "Module", "Section", "Phase", "Stage", "Chapter", "Part",
+            "Appendix", "Architecture", "Overview", "Introduction", "Requirements",
+            "Specification", "Design", "Plan", "Policy", "Process", "Procedure",
+            "Workflow", "Model", "Stack", "Platform", "Framework", "Summary",
+            "Background", "Scope", "Purpose", "Objective", "Goal", "Approach"
+        };
 
     public static string PreserveStructuredEvidence(
         string answer,
@@ -122,7 +132,9 @@ public static class StructuredQueryAnswerFormatter
                FormatTable(headers, omittedRows);
     }
 
-    public static string FormatAnswer(IReadOnlyList<VectorSearchResult> results)
+    public static string FormatAnswer(
+        IReadOnlyList<VectorSearchResult> results,
+        string? query = null)
     {
         if (TryFormatAnswer(results, out var structuredAnswer))
             return structuredAnswer;
@@ -131,10 +143,7 @@ public static class StructuredQueryAnswerFormatter
             .Select(result => new
             {
                 Result = result,
-                Text = string.IsNullOrWhiteSpace(result.TableId) &&
-                       !string.IsNullOrWhiteSpace(result.ParentText)
-                    ? result.ParentText
-                    : result.Text
+                Text = result.Text
             })
             .Where(passage => !string.IsNullOrWhiteSpace(passage.Text))
             .OrderByDescending(passage => passage.Result.Score)
@@ -143,6 +152,54 @@ public static class StructuredQueryAnswerFormatter
             .DistinctBy(passage =>
                 $"{passage.Result.DocumentId}|{passage.Result.ParentBlockId}|{passage.Text}")
             .ToList();
+
+        if (!string.IsNullOrWhiteSpace(query))
+        {
+            var focusedPassages = passages
+                .Select(passage => new
+                {
+                    passage.Result,
+                    Text = ExtractMatchingSection(passage.Text, query) ?? string.Empty
+                })
+                .Where(passage => !string.IsNullOrWhiteSpace(passage.Text))
+                .ToList();
+            if (focusedPassages.Count > 0)
+            {
+                var unprunedFocusedPassages = focusedPassages;
+                focusedPassages = focusedPassages
+                    .Where(passage =>
+                    {
+                        var normalizedText = NormalizePassage(passage.Text);
+                        return !unprunedFocusedPassages.Any(other =>
+                        {
+                            var otherText = NormalizePassage(other.Text);
+                            return other.Result.DocumentId == passage.Result.DocumentId &&
+                                   otherText.Length > normalizedText.Length &&
+                                   otherText.Contains(
+                                       normalizedText,
+                                       StringComparison.Ordinal);
+                        });
+                    })
+                    .ToList();
+
+                var queryTerms = Regex.Matches(query, @"[\p{L}\p{N}]+")
+                    .Select(match => match.Value)
+                    .Where(term => term.Length > 2)
+                    .ToList();
+                var matchingTables = passages
+                    .Where(passage => IsMarkdownTable(passage.Text) &&
+                        queryTerms.Any(term => Regex.IsMatch(
+                            passage.Text,
+                            $@"(?<![\p{{L}}\p{{N}}]){Regex.Escape(term)}(?![\p{{L}}\p{{N}}])",
+                            RegexOptions.IgnoreCase)))
+                    .ToList();
+                passages = focusedPassages
+                    .Concat(matchingTables)
+                    .DistinctBy(passage =>
+                        $"{passage.Result.DocumentId}|{passage.Result.ChunkNumber}|{passage.Text}")
+                    .ToList();
+            }
+        }
 
         if (passages.Count == 0)
             return NotFoundAnswer;
@@ -177,6 +234,96 @@ public static class StructuredQueryAnswerFormatter
 
         return builder.ToString().TrimEnd();
     }
+
+    private static string? ExtractMatchingSection(string text, string query)
+    {
+        var queryTerms = Regex.Matches(query, @"[\p{L}\p{N}]+")
+            .Select(match => match.Value)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var headings = Regex.Matches(
+            text,
+            @"(?<heading>\b(?:[\p{Lu}][\p{L}\p{N}'/&()-]*\s+){1,4}[\p{Lu}][\p{L}\p{N}'/&()-]*)(?=\s+(?:Responsible\s+for|Responsibilities|Technologies?|Technology|Description|Purpose|Scope|Overview|Requirements?|Features?|Objectives?|Goals?|Components?|Services?)\b)",
+            RegexOptions.CultureInvariant)
+            .Cast<Match>()
+            .Select(match =>
+            {
+                var heading = match.Groups["heading"];
+                var words = Regex.Matches(heading.Value, @"[\p{L}\p{N}]+")
+                    .Cast<Match>()
+                    .ToList();
+                var structuralWordIndex = words.FindLastIndex(word =>
+                    StructuralHeadingWords.Contains(word.Value));
+                if (structuralWordIndex < 0)
+                    return null;
+
+                var precedingWords = words[structuralWordIndex].Value.Equals(
+                    "Layer",
+                    StringComparison.OrdinalIgnoreCase)
+                    ? 1
+                    : 2;
+                var startWordIndex = Math.Max(
+                    0,
+                    structuralWordIndex - precedingWords);
+                return new
+                {
+                    Match = match,
+                    Start = heading.Index + words[startWordIndex].Index,
+                    HeadingText = string.Join(
+                        " ",
+                        words.Skip(startWordIndex)
+                            .Take(structuralWordIndex - startWordIndex + 1)
+                            .Select(word => word.Value))
+                };
+            })
+            .Where(heading => heading is not null)
+            .Select(heading => heading!)
+            .ToList();
+
+        var matchingSections = new List<string>();
+        for (var index = 0; index < headings.Count; index++)
+        {
+            var heading = headings[index];
+            var headingTerms = Regex.Matches(heading.HeadingText, @"[\p{L}\p{N}]+")
+                .Select(match => match.Value)
+                .ToList();
+            var matchingHeadingTerms = headingTerms
+                .AsEnumerable()
+                .Reverse()
+                .TakeWhile(queryTerms.Contains)
+                .Reverse()
+                .ToList();
+            if (matchingHeadingTerms.Count < 2)
+            {
+                continue;
+            }
+
+            var sectionEnd = index + 1 < headings.Count
+                ? headings[index + 1].Start
+                : text.Length;
+            var matchingHeadingPattern = string.Join(
+                @"\s+",
+                matchingHeadingTerms.Select(Regex.Escape));
+            var matchingHeading = Regex.Match(
+                heading.HeadingText,
+                matchingHeadingPattern,
+                RegexOptions.IgnoreCase);
+            if (!matchingHeading.Success)
+                continue;
+
+            matchingSections.Add(
+                text[(heading.Start + matchingHeading.Index)..sectionEnd].Trim());
+        }
+
+        return matchingSections.Count == 0
+            ? null
+            : string.Join(Environment.NewLine + Environment.NewLine, matchingSections);
+    }
+
+    private static bool IsMarkdownTable(string text) =>
+        Regex.IsMatch(text, @"(?m)^\s*\|.+\|\s*$");
+
+    private static string NormalizePassage(string text) =>
+        Regex.Replace(text.ToLowerInvariant(), @"\s+", " ").Trim();
 
     public static bool TryFormatAnswer(
         IReadOnlyList<VectorSearchResult> results,
