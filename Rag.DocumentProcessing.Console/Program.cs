@@ -1,4 +1,7 @@
-﻿using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Options;
+using Rag.DocumentProcessing.Configuration;
 using Rag.DocumentProcessing.Constants;
 using Rag.DocumentProcessing.Data;
 using Rag.DocumentProcessing.Interfaces;
@@ -6,8 +9,17 @@ using Rag.DocumentProcessing.Parsers;
 using Rag.DocumentProcessing.Services;
 
 var services = new ServiceCollection();
+var configuration = new ConfigurationBuilder()
+    .SetBasePath(AppContext.BaseDirectory)
+    .AddJsonFile("appsettings.json", optional: false, reloadOnChange: false)
+    .Build();
+
+services.AddSingleton<IConfiguration>(configuration);
+services.AddOptions<DocumentProcessingOptions>()
+    .Bind(configuration.GetSection("RagPaths"));
 
 services.AddSingleton<IDocumentParser, UniversalDocumentParser>();
+services.AddSingleton<IExcelTableParser, ExcelDocumentParser>();
 services.AddSingleton<IChunkingService, ChunkingService>();
 services.AddSingleton<IChunkStorage, JsonChunkStorage>();
 services.AddSingleton<IFileHashService, FileHashService>();
@@ -15,6 +27,7 @@ services.AddSingleton<IFileHashService, FileHashService>();
 var serviceProvider = services.BuildServiceProvider();
 
 var parser = serviceProvider.GetRequiredService<IDocumentParser>();
+var excelTableParser = serviceProvider.GetRequiredService<IExcelTableParser>();
 var chunkingService = serviceProvider.GetRequiredService<IChunkingService>();
 var chunkStorage = serviceProvider.GetRequiredService<IChunkStorage>();
 var fileHashService = serviceProvider.GetRequiredService<IFileHashService>();
@@ -25,7 +38,9 @@ foreach (var document in DocumentRepository.Documents)
         $"Checking Document: {document.DocumentName}");
 
     var filePath = Path.Combine(
-        DocumentConstants.DocumentsRootPath,
+        serviceProvider
+            .GetRequiredService<IOptions<DocumentProcessingOptions>>()
+            .Value.DocumentsRootPath,
         document.RelativePath.Replace(
             '/',
             Path.DirectorySeparatorChar));
@@ -55,7 +70,8 @@ foreach (var document in DocumentRepository.Documents)
             document.DocumentId);
 
     if (existingMetadata != null &&
-        existingMetadata.FileHash == currentHash)
+        existingMetadata.FileHash == currentHash &&
+        existingMetadata.ChunkingVersion == DocumentConstants.ChunkingVersion)
     {
         Console.WriteLine(
             "Document unchanged. Skipping.");
@@ -85,17 +101,27 @@ foreach (var document in DocumentRepository.Documents)
     Console.WriteLine(
         "Parsing document...");
 
-    var content =
-        await parser.ParseAndChunkAsync(filePath);
-
     Console.WriteLine(
         "Creating chunks...");
 
-    var chunks =
-        chunkingService.CreateChildChunks(
+    IReadOnlyList<Rag.DocumentProcessing.Models.DocumentChunk> chunks;
+    if (Path.GetExtension(filePath).Equals(".xlsx", StringComparison.OrdinalIgnoreCase) ||
+        Path.GetExtension(filePath).Equals(".xls", StringComparison.OrdinalIgnoreCase))
+    {
+        var tables = await excelTableParser.ParseTablesAsync(filePath);
+        chunks = chunkingService.CreateExcelTableChunks(
+            document,
+            tables,
+            DocumentConstants.ChildChunkSize);
+    }
+    else
+    {
+        var content = await parser.ParseAndChunkAsync(filePath);
+        chunks = chunkingService.CreateChildChunks(
             document,
             content,
             DocumentConstants.ChildChunkSize);
+    }
 
     await chunkStorage.SaveAsync(
         document,
@@ -139,5 +165,3 @@ foreach (var processedDocument in processedDocuments)
 }
 
 Console.WriteLine("Document processing completed.");
-
-Console.ReadKey();

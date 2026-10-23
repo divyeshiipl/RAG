@@ -1,4 +1,7 @@
 ﻿using System.Text.Json;
+using Microsoft.Extensions.Options;
+using Rag.DocumentProcessing.Configuration;
+using Rag.DocumentProcessing.Constants;
 using Rag.DocumentProcessing.Interfaces;
 using Rag.DocumentProcessing.Models;
 
@@ -6,8 +9,14 @@ namespace Rag.DocumentProcessing.Services;
 
 public class JsonChunkStorage : IChunkStorage
 {
-    private readonly string _chunksRootPath =
-        @"C:\Dev\RAG RND without Tools15Sep2026\Chunks";
+    private readonly string _chunksRootPath;
+
+    public JsonChunkStorage(IOptions<DocumentProcessingOptions> options)
+    {
+        _chunksRootPath = RequirePath(
+            options.Value.ChunksRootPath,
+            nameof(DocumentProcessingOptions.ChunksRootPath));
+    }
 
     private readonly JsonSerializerOptions _jsonOptions =
         new()
@@ -66,7 +75,8 @@ public class JsonChunkStorage : IChunkStorage
                 RelativePath = document.RelativePath,
                 FileHash = contentHash,
                 ProcessedOn = DateTime.Now,
-                TotalChunks = chunkList.Count
+                TotalChunks = chunkList.Count,
+                ChunkingVersion = DocumentConstants.ChunkingVersion
             };
 
         var metadataPath =
@@ -172,5 +182,16 @@ public class JsonChunkStorage : IChunkStorage
         }
 
         return Task.CompletedTask;
+    }
+
+    private static string RequirePath(string path, string settingName)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            throw new InvalidOperationException(
+                $"Configuration setting '{settingName}' must be provided.");
+        }
+
+        return path;
     }
 }

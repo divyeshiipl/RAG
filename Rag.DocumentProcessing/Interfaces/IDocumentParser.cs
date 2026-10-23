@@ -14,3 +14,10 @@ public interface IDocumentParser
         int overlap = DocumentConstants.Overlap,
         CancellationToken cancellationToken = default);
 }
+
+public interface IExcelTableParser
+{
+    Task<IReadOnlyList<ExcelTableBlock>> ParseTablesAsync(
+        string filePath,
+        CancellationToken cancellationToken = default);
+}

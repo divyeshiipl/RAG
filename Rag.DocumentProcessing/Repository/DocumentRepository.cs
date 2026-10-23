@@ -1,4 +1,4 @@
-﻿using Rag.DocumentProcessing.Models;
+using Rag.DocumentProcessing.Models;
 
 namespace Rag.DocumentProcessing.Data;
 
@@ -314,6 +314,36 @@ public static class DocumentRepository
             DocumentType = "Database Schema - 1",
             FileExtension = ".sql",
             RelativePath = "Asset-Management-System/SQL-Scripts/DropVendorTableSqlSrcipt.sql",
+            CreatedOn = new DateTime(2026, 8, 5)
+        },
+        new()
+        {
+            DocumentId = 34,
+            ProjectId = 1,
+            DocumentName = "Team - Dot net Developer",
+            DocumentType = "Monthly KPI Review",
+            FileExtension = ".xlsx",
+            RelativePath = "Asset-Management-System/KPI/Team - Dot net Developer.xlsx",
+            CreatedOn = new DateTime(2026, 8, 5)
+        },
+        new()
+        {
+            DocumentId = 35,
+            ProjectId = 1,
+            DocumentName = "asset management data",
+            DocumentType = "Asset Management Data",
+            FileExtension = ".xlsx",
+            RelativePath = "Asset-Management-System/Asset Management Data/asset_management_data.xlsx",
+            CreatedOn = new DateTime(2026, 8, 5)
+        },
+        new()
+        {
+            DocumentId = 36,
+            ProjectId = 1,
+            DocumentName = "Project Management Data",
+            DocumentType = "Project Management Data",
+            FileExtension = ".xlsx",
+            RelativePath = "Asset-Management-System/Project Management Data/Project-Management-Data.xlsx",
             CreatedOn = new DateTime(2026, 8, 5)
         }
     ];

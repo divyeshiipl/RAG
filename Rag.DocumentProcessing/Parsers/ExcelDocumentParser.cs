@@ -1,742 +1,329 @@
-﻿using ClosedXML.Excel;
+using ClosedXML.Excel;
 using Rag.DocumentProcessing.Constants;
 using Rag.DocumentProcessing.Interfaces;
+using Rag.DocumentProcessing.Models;
 using System.Text;
-using System.Text.RegularExpressions;
 
 namespace Rag.DocumentProcessing.Parsers;
 
-public class ExcelDocumentParser : IDocumentParser
+public class ExcelDocumentParser : IDocumentParser, IExcelTableParser
 {
-    private static readonly Regex CellReferenceRegex =
-        new(@"^[A-Z]+", RegexOptions.Compiled);
-
     public Task<string> ParseAsync(
         string filePath,
         CancellationToken cancellationToken = default)
     {
-        using var workbook =
-            new XLWorkbook(filePath);
+        using var workbook = new XLWorkbook(filePath);
 
-        var builder =
-            new StringBuilder();
+        var builder = new StringBuilder();
 
-        var fileName =
-            Path.GetFileNameWithoutExtension(filePath);
+        var fileName = Path.GetFileNameWithoutExtension(filePath);
 
-        builder.AppendLine(
-            $"Excel Document: {fileName}");
+        builder.AppendLine($"Excel Document: {fileName}");
 
         foreach (var worksheet in workbook.Worksheets)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            var range =
-                worksheet.RangeUsed();
+            var range = worksheet.RangeUsed();
 
             if (range == null)
-            {
                 continue;
-            }
 
-            var sheetText =
-                ParseWorksheet(
-                    worksheet,
-                    range,
-                    cancellationToken);
+            var sheetText = ConvertSheetToMarkdown(
+                worksheet,
+                range,
+                cancellationToken);
 
-            if (string.IsNullOrWhiteSpace(
-                sheetText))
-            {
+            if (string.IsNullOrWhiteSpace(sheetText))
                 continue;
-            }
 
             builder.AppendLine();
-            builder.AppendLine(
-                $"Sheet: {worksheet.Name}");
-
+            builder.AppendLine($"Sheet: {worksheet.Name}");
             builder.AppendLine();
-
-            builder.AppendLine(
-                sheetText);
+            builder.AppendLine(sheetText);
         }
 
         return Task.FromResult(
-            NormalizeDocumentText(
-                builder.ToString()));
+            NormalizeDocumentText(builder.ToString()));
     }
 
-    public Task<List<string>> ParseAndChunkAsync(
+    public async Task<List<string>> ParseAndChunkAsync(
         string filePath,
         int chunkSize = DocumentConstants.ChunkSize,
         int childChunkSize = DocumentConstants.ChildChunkSize,
         int overlap = DocumentConstants.Overlap,
         CancellationToken cancellationToken = default)
     {
-        using var workbook =
-            new XLWorkbook(filePath);
+        var tables = await ParseTablesAsync(filePath, cancellationToken);
+        return tables.Select(table =>
+        {
+            var lines = new List<string>();
+            lines.Add(FormatMarkdownRow(table.Headers));
+            lines.Add(FormatMarkdownSeparator(table.Headers.Count));
+            lines.AddRange(table.Rows.Select(row => row.Text));
+            return string.Join(Environment.NewLine, lines);
+        }).ToList();
+    }
 
-        var parentChunks =
-            new List<string>();
+    public Task<IReadOnlyList<ExcelTableBlock>> ParseTablesAsync(
+        string filePath,
+        CancellationToken cancellationToken = default)
+    {
+        using var workbook = new XLWorkbook(filePath);
+        var tables = new List<ExcelTableBlock>();
 
         foreach (var worksheet in workbook.Worksheets)
         {
             cancellationToken.ThrowIfCancellationRequested();
-
-            var range =
-                worksheet.RangeUsed();
-
-            if (range == null)
-            {
+            var range = worksheet.RangeUsed();
+            if (range is null)
                 continue;
+
+            var currentRows = new List<ExcelSourceRow>();
+            var tableContext = string.Empty;
+            var tableIndex = 0;
+
+            void FlushTable()
+            {
+                if (currentRows.Count >= 2)
+                {
+                    var header = currentRows[0];
+                    var dataRows = currentRows.Skip(1).ToList();
+                    var rowKeyColumns = GetUniqueValueColumns(header.Cells.Count, dataRows);
+
+                    if (header.Cells.Count > 0 && dataRows.Count > 0)
+                    {
+                        tables.Add(new ExcelTableBlock
+                        {
+                            SheetName = worksheet.Name,
+                            TableContext = tableContext,
+                            TableIndex = ++tableIndex,
+                            Headers = header.Cells,
+                            Rows = dataRows.Select(row => new ExcelTableRow
+                            {
+                                RowIndex = row.RowIndex,
+                                Text = FormatMarkdownRow(row.Cells, header.Cells.Count),
+                                Cells = row.Cells,
+                                Fields = CreateStructuredFields(header.Cells, row.Cells),
+                                Identifiers = rowKeyColumns
+                                    .Where(index => index < row.Cells.Count)
+                                    .Select(index => row.Cells[index])
+                                    .Where(value => !string.IsNullOrWhiteSpace(value))
+                                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                                    .ToList()
+                            }).ToList()
+                        });
+                    }
+                }
+
+                currentRows.Clear();
             }
 
-            var rows =
-                ExtractWorksheetRows(
-                    worksheet,
-                    range,
-                    cancellationToken);
-
-            if (rows.Count == 0)
+            foreach (var row in range.Rows())
             {
-                continue;
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var cells = row.Cells()
+                    .Select(GetCellText)
+                    .ToList();
+
+                while (cells.Count > 0 && string.IsNullOrWhiteSpace(cells[^1]))
+                    cells.RemoveAt(cells.Count - 1);
+
+                if (cells.All(string.IsNullOrWhiteSpace))
+                {
+                    FlushTable();
+                    tableContext = string.Empty;
+                    continue;
+                }
+
+                var populatedCells = cells.Count(value => !string.IsNullOrWhiteSpace(value));
+                if (populatedCells == 1 && currentRows.Count > 0)
+                {
+                    FlushTable();
+                    tableContext = cells.First(value => !string.IsNullOrWhiteSpace(value));
+                    continue;
+                }
+
+                if (currentRows.Count >= 2 &&
+                    RowsMatch(currentRows[0].Cells, cells))
+                {
+                    FlushTable();
+                }
+
+                if (currentRows.Count == 0 && populatedCells == 1)
+                {
+                    tableContext = cells.First(value => !string.IsNullOrWhiteSpace(value));
+                    continue;
+                }
+
+                currentRows.Add(new ExcelSourceRow(row.RowNumber(), cells));
             }
 
-            var sheetBlocks =
-                ConvertRowsToSemanticBlocks(
-                    worksheet.Name,
-                    rows);
-
-            var chunks =
-                BuildChunks(
-                    sheetBlocks,
-                    chunkSize);
-
-            parentChunks.AddRange(
-                chunks);
+            FlushTable();
         }
 
-        return Task.FromResult(
-            parentChunks);
+        return Task.FromResult<IReadOnlyList<ExcelTableBlock>>(tables);
     }
 
-    private static string ParseWorksheet(
-        IXLWorksheet worksheet,
-        IXLRange range,
-        CancellationToken cancellationToken)
+    private static List<int> GetUniqueValueColumns(
+        int columnCount,
+        IReadOnlyList<ExcelSourceRow> rows)
     {
-        var rows =
-            ExtractWorksheetRows(
-                worksheet,
-                range,
-                cancellationToken);
+        return Enumerable.Range(0, columnCount)
+            .Where(columnIndex =>
+            {
+                var values = rows
+                    .Select(row => columnIndex < row.Cells.Count
+                        ? row.Cells[columnIndex].Trim()
+                        : string.Empty)
+                    .ToList();
+                var nonEmptyValues = values
+                    .Where(value => value.Length > 0)
+                    .ToList();
 
-        if (rows.Count == 0)
+                return nonEmptyValues.Count == rows.Count &&
+                       nonEmptyValues.Distinct(StringComparer.OrdinalIgnoreCase).Count() == rows.Count;
+            })
+            .ToList();
+    }
+
+    private static IReadOnlyDictionary<string, string> CreateStructuredFields(
+        IReadOnlyList<string> headers,
+        IReadOnlyList<string> cells)
+    {
+        var fields = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        for (var index = 0; index < headers.Count; index++)
         {
-            return string.Empty;
+            var header = string.IsNullOrWhiteSpace(headers[index])
+                ? $"Column {index + 1}"
+                : headers[index].Trim();
+
+            var uniqueHeader = header;
+            var duplicateIndex = 2;
+            while (fields.ContainsKey(uniqueHeader))
+                uniqueHeader = $"{header} ({duplicateIndex++})";
+
+            fields[uniqueHeader] = index < cells.Count ? cells[index] : string.Empty;
         }
 
-        var blocks =
-            ConvertRowsToSemanticBlocks(
-                worksheet.Name,
-                rows);
-
-        return string.Join(
-            Environment.NewLine +
-            Environment.NewLine,
-            blocks);
+        return fields;
     }
 
-    private static List<ExcelRow> ExtractWorksheetRows(
+    private static bool RowsMatch(
+        IReadOnlyList<string> first,
+        IReadOnlyList<string> candidate)
+    {
+        return first.Count == candidate.Count &&
+               first.SequenceEqual(candidate, StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static string FormatMarkdownRow(
+        IReadOnlyList<string> cells,
+        int columnCount)
+    {
+        return "| " +
+               string.Join(
+                   " | ",
+                   Enumerable.Range(0, columnCount)
+                       .Select(index => index < cells.Count ? cells[index] : string.Empty)
+                       .Select(value => value.Replace("|", "\\|", StringComparison.Ordinal))) +
+               " |";
+    }
+
+    private static string FormatMarkdownRow(IReadOnlyList<string> cells)
+    {
+        return FormatMarkdownRow(cells, cells.Count);
+    }
+
+    private static string FormatMarkdownSeparator(int columnCount)
+    {
+        return "| " + string.Join(" | ", Enumerable.Repeat("---", columnCount)) + " |";
+    }
+
+    private sealed record ExcelSourceRow(int RowIndex, List<string> Cells);
+
+    private static string ConvertSheetToMarkdown(
         IXLWorksheet worksheet,
         IXLRange range,
         CancellationToken cancellationToken)
     {
-        var rows =
-            new List<ExcelRow>();
+        var rows = new List<List<string>>();
 
         foreach (var row in range.Rows())
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            var cells =
-                new List<string>();
-
+            var cells = new List<string>();
             var hasValue = false;
 
             foreach (var cell in row.Cells())
             {
-                var value =
-                    GetCellText(cell);
-
+                var value = GetCellText(cell);
                 cells.Add(value);
 
-                if (!string.IsNullOrWhiteSpace(
-                    value))
-                {
+                if (!string.IsNullOrWhiteSpace(value))
                     hasValue = true;
-                }
             }
 
             if (!hasValue)
-            {
                 continue;
-            }
 
-            rows.Add(
-                new ExcelRow
-                {
-                    RowNumber = row.RowNumber(),
-                    Cells = cells
-                });
+            rows.Add(cells);
         }
-
-        return rows;
-    }
-
-    private static List<string> ConvertRowsToSemanticBlocks(
-        string sheetName,
-        List<ExcelRow> rows)
-    {
-        var blocks =
-            new List<string>();
 
         if (rows.Count == 0)
-        {
-            return blocks;
-        }
-
-        var headerRow =
-            DetectHeaderRow(rows);
-
-        var headers =
-            BuildHeaders(
-                headerRow);
-
-        var dataRows =
-            rows
-                .Where(row =>
-                    row.RowNumber >
-                    headerRow.RowNumber)
-                .ToList();
-
-        if (dataRows.Count == 0)
-        {
-            var singleBlock =
-                ConvertSingleRow(
-                    sheetName,
-                    headers);
-
-            if (!string.IsNullOrWhiteSpace(
-                singleBlock))
-            {
-                blocks.Add(
-                    singleBlock);
-            }
-
-            return blocks;
-        }
-
-        foreach (var row in dataRows)
-        {
-            var block =
-                ConvertDataRow(
-                    sheetName,
-                    headers,
-                    row);
-
-            if (!string.IsNullOrWhiteSpace(
-                block))
-            {
-                blocks.Add(block);
-            }
-        }
-
-        return blocks;
-    }
-
-    private static ExcelRow DetectHeaderRow(
-        List<ExcelRow> rows)
-    {
-        if (rows.Count == 1)
-        {
-            return rows[0];
-        }
-
-        var firstRow =
-            rows[0];
-
-        var secondRow =
-            rows[1];
-
-        if (LooksLikeHeader(
-            firstRow,
-            secondRow))
-        {
-            return firstRow;
-        }
-
-        return firstRow;
-    }
-
-    private static bool LooksLikeHeader(
-        ExcelRow header,
-        ExcelRow data)
-    {
-        var headerValues =
-            header.Cells
-                .Where(x =>
-                    !string.IsNullOrWhiteSpace(x))
-                .ToList();
-
-        var dataValues =
-            data.Cells
-                .Where(x =>
-                    !string.IsNullOrWhiteSpace(x))
-                .ToList();
-
-        if (headerValues.Count == 0)
-        {
-            return false;
-        }
-
-        if (dataValues.Count == 0)
-        {
-            return true;
-        }
-
-        var headerScore =
-            headerValues.Count;
-
-        var duplicateHeaders =
-            headerValues
-                .GroupBy(
-                    x => x,
-                    StringComparer.OrdinalIgnoreCase)
-                .Count(group =>
-                    group.Count() > 1);
-
-        if (duplicateHeaders > 0)
-        {
-            headerScore -= duplicateHeaders;
-        }
-
-        return headerScore >=
-               Math.Min(
-                   2,
-                   dataValues.Count);
-    }
-
-    private static List<string> BuildHeaders(
-        ExcelRow headerRow)
-    {
-        var headers =
-            new List<string>();
-
-        for (var index = 0;
-             index < headerRow.Cells.Count;
-             index++)
-        {
-            var header =
-                headerRow.Cells[index].Trim();
-
-            if (string.IsNullOrWhiteSpace(
-                header))
-            {
-                header =
-                    $"Column {index + 1}";
-            }
-
-            var originalHeader =
-                header;
-
-            var duplicateNumber = 2;
-
-            while (headers.Any(
-                existing =>
-                    string.Equals(
-                        existing,
-                        header,
-                        StringComparison
-                            .OrdinalIgnoreCase)))
-            {
-                header =
-                    $"{originalHeader} {duplicateNumber}";
-
-                duplicateNumber++;
-            }
-
-            headers.Add(header);
-        }
-
-        return headers;
-    }
-
-    private static string ConvertSingleRow(
-        string sheetName,
-        List<string> headers)
-    {
-        if (headers.Count == 0)
-        {
             return string.Empty;
-        }
 
-        var builder =
-            new StringBuilder();
+        var columnCount = rows.Max(r => r.Count);
 
-        builder.AppendLine(
-            $"Sheet: {sheetName}");
+        var builder = new StringBuilder();
 
-        foreach (var header in headers)
+        foreach (var row in rows)
         {
-            if (!string.IsNullOrWhiteSpace(
-                header))
+            builder.Append("| ");
+
+            for (var i = 0; i < columnCount; i++)
             {
-                builder.AppendLine(
-                    $"{header}:");
+                var value = i < row.Count ? row[i] : string.Empty;
+
+                // Escape pipe characters
+                value = value.Replace("|", "\\|");
+
+                builder.Append(value);
+                builder.Append(" | ");
             }
+
+            builder.AppendLine();
         }
 
         return builder.ToString().Trim();
     }
 
-    private static string ConvertDataRow(
-        string sheetName,
-        List<string> headers,
-        ExcelRow row)
-    {
-        var values =
-            new List<string>();
-
-        var maxColumns =
-            Math.Min(
-                headers.Count,
-                row.Cells.Count);
-
-        for (var index = 0;
-             index < maxColumns;
-             index++)
-        {
-            var value =
-                row.Cells[index].Trim();
-
-            if (string.IsNullOrWhiteSpace(
-                value))
-            {
-                continue;
-            }
-
-            var header =
-                headers[index];
-
-            if (string.IsNullOrWhiteSpace(
-                header))
-            {
-                header =
-                    $"Column {index + 1}";
-            }
-
-            values.Add(
-                $"{header}: {value}");
-        }
-
-        if (values.Count == 0)
-        {
-            return string.Empty;
-        }
-
-        var builder =
-            new StringBuilder();
-
-        builder.AppendLine(
-            $"Sheet: {sheetName}");
-
-        builder.AppendLine(
-            $"Excel Row: {row.RowNumber}");
-
-        foreach (var value in values)
-        {
-            builder.AppendLine(value);
-        }
-
-        return builder.ToString().Trim();
-    }
-
-    private static List<string> BuildChunks(
-        List<string> blocks,
-        int chunkSize)
-    {
-        var chunks =
-            new List<string>();
-
-        if (blocks.Count == 0)
-        {
-            return chunks;
-        }
-
-        var current =
-            new StringBuilder();
-
-        foreach (var rawBlock in blocks)
-        {
-            if (string.IsNullOrWhiteSpace(
-                rawBlock))
-            {
-                continue;
-            }
-
-            var block =
-                NormalizeDocumentText(
-                    rawBlock);
-
-            if (string.IsNullOrWhiteSpace(
-                block))
-            {
-                continue;
-            }
-
-            var separator =
-                current.Length == 0
-                    ? string.Empty
-                    : Environment.NewLine +
-                      Environment.NewLine;
-
-            var candidateLength =
-                current.Length +
-                separator.Length +
-                block.Length;
-
-            if (candidateLength <=
-                chunkSize)
-            {
-                current.Append(
-                    separator);
-
-                current.Append(
-                    block);
-
-                continue;
-            }
-
-            if (current.Length > 0)
-            {
-                chunks.Add(
-                    current
-                        .ToString()
-                        .Trim());
-
-                current.Clear();
-            }
-
-            if (block.Length <=
-                chunkSize)
-            {
-                current.Append(
-                    block);
-
-                continue;
-            }
-
-            var largeBlocks =
-                SplitLargeBlock(
-                    block,
-                    chunkSize);
-
-            for (var index = 0;
-                 index < largeBlocks.Count - 1;
-                 index++)
-            {
-                chunks.Add(
-                    largeBlocks[index]);
-            }
-
-            if (largeBlocks.Count > 0)
-            {
-                current.Append(
-                    largeBlocks[^1]);
-            }
-        }
-
-        if (current.Length > 0)
-        {
-            chunks.Add(
-                current
-                    .ToString()
-                    .Trim());
-        }
-
-        return chunks;
-    }
-
-    private static List<string> SplitLargeBlock(
-        string text,
-        int chunkSize)
-    {
-        var result =
-            new List<string>();
-
-        var lines =
-            text.Split(
-                new[]
-                {
-                    "\r\n",
-                    "\n",
-                    "\r"
-                },
-                StringSplitOptions.RemoveEmptyEntries);
-
-        var current =
-            new StringBuilder();
-
-        foreach (var line in lines)
-        {
-            var cleanLine =
-                line.Trim();
-
-            if (string.IsNullOrWhiteSpace(
-                cleanLine))
-            {
-                continue;
-            }
-
-            var separator =
-                current.Length == 0
-                    ? string.Empty
-                    : Environment.NewLine;
-
-            if (current.Length +
-                separator.Length +
-                cleanLine.Length <=
-                chunkSize)
-            {
-                current.Append(
-                    separator);
-
-                current.Append(
-                    cleanLine);
-
-                continue;
-            }
-
-            if (current.Length > 0)
-            {
-                result.Add(
-                    current
-                        .ToString()
-                        .Trim());
-
-                current.Clear();
-            }
-
-            if (cleanLine.Length <=
-                chunkSize)
-            {
-                current.Append(
-                    cleanLine);
-
-                continue;
-            }
-
-            SplitLongLine(
-                cleanLine,
-                chunkSize,
-                result,
-                current);
-        }
-
-        if (current.Length > 0)
-        {
-            result.Add(
-                current
-                    .ToString()
-                    .Trim());
-        }
-
-        return result;
-    }
-
-    private static void SplitLongLine(
-        string text,
-        int chunkSize,
-        List<string> result,
-        StringBuilder current)
-    {
-        var words =
-            text.Split(
-                ' ',
-                StringSplitOptions.RemoveEmptyEntries);
-
-        foreach (var word in words)
-        {
-            var separator =
-                current.Length == 0
-                    ? string.Empty
-                    : " ";
-
-            if (current.Length +
-                separator.Length +
-                word.Length <=
-                chunkSize)
-            {
-                current.Append(
-                    separator);
-
-                current.Append(
-                    word);
-
-                continue;
-            }
-
-            if (current.Length > 0)
-            {
-                result.Add(
-                    current
-                        .ToString()
-                        .Trim());
-
-                current.Clear();
-            }
-
-            current.Append(word);
-        }
-    }
-
-    private static string GetCellText(
-        IXLCell cell)
+    private static string GetCellText(IXLCell cell)
     {
         if (cell.IsEmpty())
-        {
             return string.Empty;
-        }
 
         try
         {
-            var value =
-                cell.GetFormattedString();
+            var value = cell.GetFormattedString();
 
-            if (!string.IsNullOrWhiteSpace(
-                value))
-            {
-                return NormalizeCellText(
-                    value);
-            }
+            if (!string.IsNullOrWhiteSpace(value))
+                return NormalizeCellText(value);
         }
         catch
         {
         }
 
-        return NormalizeCellText(
-            cell.GetString());
+        return NormalizeCellText(cell.GetString());
     }
 
-    private static string NormalizeCellText(
-        string value)
+    private static string NormalizeCellText(string value)
     {
-        if (string.IsNullOrWhiteSpace(
-            value))
-        {
+        if (string.IsNullOrWhiteSpace(value))
             return string.Empty;
-        }
 
         return string.Join(
             " ",
@@ -744,44 +331,24 @@ public class ExcelDocumentParser : IDocumentParser
                 .Replace("\r\n", " ")
                 .Replace("\r", " ")
                 .Replace("\n", " ")
-                .Split(
-                    ' ',
-                    StringSplitOptions
-                        .RemoveEmptyEntries))
+                .Split(' ', StringSplitOptions.RemoveEmptyEntries))
             .Trim();
     }
 
-    private static string NormalizeDocumentText(
-        string text)
+    private static string NormalizeDocumentText(string text)
     {
-        if (string.IsNullOrWhiteSpace(
-            text))
-        {
+        if (string.IsNullOrWhiteSpace(text))
             return string.Empty;
-        }
 
         text = text
             .Replace("\r\n", "\n")
             .Replace("\r", "\n");
 
-        var lines =
-            text
-                .Split('\n')
-                .Select(line => line.Trim())
-                .Where(line =>
-                    !string.IsNullOrWhiteSpace(
-                        line));
+        var lines = text
+            .Split('\n')
+            .Select(line => line.Trim())
+            .Where(line => !string.IsNullOrWhiteSpace(line));
 
-        return string.Join(
-            Environment.NewLine,
-            lines);
-    }
-
-    private sealed class ExcelRow
-    {
-        public int RowNumber { get; init; }
-
-        public List<string> Cells { get; init; } =
-            new();
+        return string.Join(Environment.NewLine, lines);
     }
 }

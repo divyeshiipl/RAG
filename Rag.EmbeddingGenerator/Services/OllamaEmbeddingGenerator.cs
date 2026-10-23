@@ -6,6 +6,9 @@ namespace Rag.EmbeddingGenerator.Services;
 
 public class OllamaEmbeddingGenerator : IEmbeddingGenerator
 {
+    private const int MaxWordsForModel = 100;
+    private const int MaxCharsForModel = 2000;
+    private const int ModelContextSize = 512;
     private readonly HttpClient _httpClient;
 
     public OllamaEmbeddingGenerator(HttpClient httpClient)
@@ -22,14 +25,17 @@ public class OllamaEmbeddingGenerator : IEmbeddingGenerator
             return new float[384];
         }
 
+        var safeText = PrepareTextForEmbedding(text);
+
         var requestPayload = new
         {
             model = "all-minilm",
-            prompt = text,
-            truncate = true, // Instructs Ollama to truncate text exceeding max window
+            prompt = safeText,
+            truncate = true,
+            keep_alive = "30m",
             options = new
             {
-                num_ctx = 2048 // Expands context window limit up to model max
+                num_ctx = ModelContextSize
             }
         };
 
@@ -48,6 +54,29 @@ public class OllamaEmbeddingGenerator : IEmbeddingGenerator
             cancellationToken: cancellationToken);
 
         return result?.Embedding ?? Array.Empty<float>();
+    }
+
+    private static string PrepareTextForEmbedding(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return string.Empty;
+
+        var normalized = string.Join(" ", text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+
+        if (normalized.Length <= MaxCharsForModel)
+        {
+            var words = normalized.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (words.Length <= MaxWordsForModel)
+            {
+                return normalized;
+            }
+
+            return string.Join(" ", words.Take(MaxWordsForModel));
+        }
+
+        var allWords = normalized.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var limitedWords = allWords.Take(MaxWordsForModel).ToArray();
+        return string.Join(" ", limitedWords).Trim();
     }
 
     private class OllamaResponse
